@@ -1,0 +1,42 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: bes-blind-db
+    environment:
+      POSTGRES_DB: bes_blind
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - bes-blind-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d bes_blind"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bes-blind-backend
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      BES_ADDR: ":8080"
+      # Backend reads DATABASE_URL (preferred) or BES_DATABASE_URL
+      DATABASE_URL: "postgres://postgres:postgres@db:5432/bes_blind?sslmode=disable"
+      # Allow Vite dev server origin by default
+      BES_CORS_ALLOWED_ORIGINS: "http://localhost:5173"
+      # Migrations run on startup by default; set to 1 to disable
+      # BES_MIGRATIONS_DISABLE: "1"
+      # Optional: override migrations directory inside container
+      # BES_MIGRATIONS_DIR: "backend/migrations"
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+volumes:
+  bes-blind-pgdata:

@@ -1,0 +1,72 @@
+# === OS / Editor ===
+.DS_Store
+Thumbs.db
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
+*.log
+
+# === Go ===
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, coverage
+*.test
+*.out
+coverage.out
+coverprofile
+*.coverprofile
+
+# Go workspace / build cache (when present)
+bin/
+dist/
+tmp/
+*.local
+
+# If you use Go workspaces locally
+go.work
+go.work.sum
+
+# === Node / Vue ===
+frontend/node_modules/
+**/node_modules/
+
+# Vite / Vue build output
+frontend/dist/
+**/dist/
+
+# Vite cache
+frontend/.vite/
+**/.vite/
+
+# Optional caches
+**/.cache/
+**/.parcel-cache/
+**/.turbo/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Env files (keep examples committed separately if desired)
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# === TypeScript / tooling ===
+*.tsbuildinfo
+
+# === Misc ===
+*.pem
+*.key
