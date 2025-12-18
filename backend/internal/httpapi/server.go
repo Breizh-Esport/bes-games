@@ -13,11 +13,13 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/cors"
 
-	"github.com/valentin/bes-blind/backend/internal/game"
-	"github.com/valentin/bes-blind/backend/internal/realtime"
+	"github.com/valentin/bes-games/backend/internal/core"
+	"github.com/valentin/bes-games/backend/internal/games"
+	"github.com/valentin/bes-games/backend/internal/games/namethattune"
+	"github.com/valentin/bes-games/backend/internal/realtime"
 )
 
-// Server provides the HTTP API (REST + WebSocket) for the name-that-tune game.
+// Server provides the HTTP API (REST + WebSocket) for bes-games.
 //
 // Auth model (still temporary until real OIDC validation is implemented):
 //   - Authenticated requests must include:
@@ -25,43 +27,48 @@ import (
 //   - Anonymous users can join rooms without it.
 //
 // Persistence model:
-//   - All state (profiles, playlists, rooms, players, playback) is stored in Postgres via game.Repo.
+//   - Core user profile is stored in Postgres via core.Repo.
+//   - Game state (rooms, players, playback, playlists) is stored in Postgres via a game repo.
 //   - Realtime updates are fanned out via realtime.Registry (in-memory pub/sub), while the source of truth is DB.
 //
 // Endpoints (summary):
 // - GET    /healthz
-// - GET    /api/rooms
-// - POST   /api/rooms                    (auth required)
-// - GET    /api/rooms/{roomId}
-// - POST   /api/rooms/{roomId}/join      (anon allowed)
-// - POST   /api/rooms/{roomId}/leave
-// - WS     /api/rooms/{roomId}/ws
+// - GET    /api/games
 //
-// Owner controls (auth required; must be room owner):
-// - POST   /api/rooms/{roomId}/kick
-// - POST   /api/rooms/{roomId}/score/set
-// - POST   /api/rooms/{roomId}/score/add
-// - POST   /api/rooms/{roomId}/playlist/load
-// - POST   /api/rooms/{roomId}/playback/set
-// - POST   /api/rooms/{roomId}/playback/pause
-// - POST   /api/rooms/{roomId}/playback/seek
+// Rooms (per-game):
+// - GET    /api/games/{gameId}/rooms
+// - POST   /api/games/{gameId}/rooms                          (auth required)
+// - GET    /api/games/{gameId}/rooms/{roomId}
+// - POST   /api/games/{gameId}/rooms/{roomId}/join            (anon allowed)
+// - POST   /api/games/{gameId}/rooms/{roomId}/leave
+// - WS     /api/games/{gameId}/rooms/{roomId}/ws
+//
+// Owner controls (auth required; must be room owner) (per-game):
+// - POST   /api/games/{gameId}/rooms/{roomId}/kick
+// - POST   /api/games/{gameId}/rooms/{roomId}/score/set
+// - POST   /api/games/{gameId}/rooms/{roomId}/score/add
+// - POST   /api/games/{gameId}/rooms/{roomId}/playlist/load
+// - POST   /api/games/{gameId}/rooms/{roomId}/playback/set
+// - POST   /api/games/{gameId}/rooms/{roomId}/playback/pause
+// - POST   /api/games/{gameId}/rooms/{roomId}/playback/seek
 //
 // Profile (auth required):
 // - GET    /api/me
 // - PUT    /api/me
 // - DELETE /api/me
 //
-// Playlists (auth required):
-// - GET    /api/me/playlists
-// - POST   /api/me/playlists
-// - PATCH  /api/me/playlists/{playlistId}
-// - POST   /api/me/playlists/{playlistId}/items
+// Playlists (per-game, auth required):
+// - GET    /api/games/{gameId}/playlists
+// - POST   /api/games/{gameId}/playlists
+// - PATCH  /api/games/{gameId}/playlists/{playlistId}
+// - POST   /api/games/{gameId}/playlists/{playlistId}/items
 //
-// Player actions:
-// - POST   /api/rooms/{roomId}/buzz
+// Player actions (per-game):
+// - POST   /api/games/{gameId}/rooms/{roomId}/buzz
 type Server struct {
-	repo *game.Repo
-	rt   *realtime.Registry
+	coreRepo *core.Repo
+	nttRepo  *namethattune.Repo
+	rt       *realtime.Registry
 }
 
 type wsOriginPatternsCtxKey struct{}
@@ -81,8 +88,8 @@ type Options struct {
 	ReadHeaderTimeout time.Duration
 }
 
-func NewServer(repo *game.Repo, rt *realtime.Registry) *Server {
-	return &Server{repo: repo, rt: rt}
+func NewServer(coreRepo *core.Repo, nttRepo *namethattune.Repo, rt *realtime.Registry) *Server {
+	return &Server{coreRepo: coreRepo, nttRepo: nttRepo, rt: rt}
 }
 
 func (s *Server) Handler(opts Options) http.Handler {
@@ -123,39 +130,44 @@ func (s *Server) Handler(opts Options) http.Handler {
 	})
 
 	r.Route("/api", func(api chi.Router) {
-		api.Get("/rooms", s.handleListRooms)
-		api.Post("/rooms", s.requireAuth(s.handleCreateRoom))
+		api.Get("/games", s.handleListGames)
 
-		api.Route("/rooms/{roomId}", func(rr chi.Router) {
-			rr.Get("/", s.handleGetRoom)
-			rr.Post("/join", s.handleJoinRoom)
-			rr.Post("/leave", s.handleLeaveRoom)
+		// Canonical per-game routes (prepared for multiple games).
+		api.Route("/games/name-that-tune", func(ntt chi.Router) {
+			ntt.Get("/rooms", s.handleListRooms)
+			ntt.Post("/rooms", s.requireAuth(s.handleCreateRoom))
 
-			rr.Get("/ws", s.handleRoomWS)
+			ntt.Route("/rooms/{roomId}", func(rr chi.Router) {
+				rr.Get("/", s.handleGetRoom)
+				rr.Post("/join", s.handleJoinRoom)
+				rr.Post("/leave", s.handleLeaveRoom)
 
-			// Owner controls
-			rr.Post("/kick", s.requireAuth(s.handleKick))
-			rr.Post("/score/set", s.requireAuth(s.handleScoreSet))
-			rr.Post("/score/add", s.requireAuth(s.handleScoreAdd))
-			rr.Post("/playlist/load", s.requireAuth(s.handleLoadPlaylist))
-			rr.Post("/playback/set", s.requireAuth(s.handlePlaybackSet))
-			rr.Post("/playback/pause", s.requireAuth(s.handlePlaybackPause))
-			rr.Post("/playback/seek", s.requireAuth(s.handlePlaybackSeek))
+				rr.Get("/ws", s.handleRoomWS)
 
-			// Player actions
-			rr.Post("/buzz", s.handleBuzz)
+				// Owner controls
+				rr.Post("/kick", s.requireAuth(s.handleKick))
+				rr.Post("/score/set", s.requireAuth(s.handleScoreSet))
+				rr.Post("/score/add", s.requireAuth(s.handleScoreAdd))
+				rr.Post("/playlist/load", s.requireAuth(s.handleLoadPlaylist))
+				rr.Post("/playback/set", s.requireAuth(s.handlePlaybackSet))
+				rr.Post("/playback/pause", s.requireAuth(s.handlePlaybackPause))
+				rr.Post("/playback/seek", s.requireAuth(s.handlePlaybackSeek))
+
+				// Player actions
+				rr.Post("/buzz", s.handleBuzz)
+			})
+
+			// Game-specific playlists (owned by the authenticated user).
+			ntt.Get("/playlists", s.requireAuth(s.handleListPlaylists))
+			ntt.Post("/playlists", s.requireAuth(s.handleCreatePlaylist))
+			ntt.Patch("/playlists/{playlistId}", s.requireAuth(s.handlePatchPlaylist))
+			ntt.Post("/playlists/{playlistId}/items", s.requireAuth(s.handleAddPlaylistItem))
 		})
 
 		// Profile / account
 		api.Get("/me", s.requireAuth(s.handleGetMe))
 		api.Put("/me", s.requireAuth(s.handlePutMe))
 		api.Delete("/me", s.requireAuth(s.handleDeleteMe))
-
-		// Playlists
-		api.Get("/me/playlists", s.requireAuth(s.handleListMyPlaylists))
-		api.Post("/me/playlists", s.requireAuth(s.handleCreateMyPlaylist))
-		api.Patch("/me/playlists/{playlistId}", s.requireAuth(s.handlePatchMyPlaylist))
-		api.Post("/me/playlists/{playlistId}/items", s.requireAuth(s.handleAddMyPlaylistItem))
 	})
 
 	return r
@@ -212,17 +224,17 @@ func mapDomainErr(err error) (int, string) {
 	switch {
 	case err == nil:
 		return http.StatusOK, ""
-	case errors.Is(err, game.ErrUnauthorized):
+	case errors.Is(err, core.ErrUnauthorized):
 		return http.StatusUnauthorized, err.Error()
-	case errors.Is(err, game.ErrNotOwner):
+	case errors.Is(err, core.ErrNotOwner):
 		return http.StatusForbidden, err.Error()
-	case errors.Is(err, game.ErrRoomNotFound):
+	case errors.Is(err, core.ErrRoomNotFound):
 		return http.StatusNotFound, err.Error()
-	case errors.Is(err, game.ErrPlayerNotFound):
+	case errors.Is(err, core.ErrPlayerNotFound):
 		return http.StatusNotFound, err.Error()
-	case errors.Is(err, game.ErrPlaylistNotFound):
+	case errors.Is(err, namethattune.ErrPlaylistNotFound):
 		return http.StatusNotFound, err.Error()
-	case errors.Is(err, game.ErrInvalidInput):
+	case errors.Is(err, core.ErrInvalidInput):
 		return http.StatusBadRequest, err.Error()
 	default:
 		return http.StatusInternalServerError, "internal server error"
@@ -234,7 +246,7 @@ func (s *Server) broadcastSnapshot(ctx context.Context, roomID string) {
 	if s.rt == nil {
 		return
 	}
-	snap, err := s.repo.GetRoomSnapshot(ctx, roomID)
+	snap, err := s.nttRepo.GetRoomSnapshot(ctx, roomID)
 	if err != nil {
 		// If snapshot can't be fetched, do not broadcast.
 		return
@@ -251,7 +263,7 @@ func (s *Server) broadcastSnapshot(ctx context.Context, roomID string) {
 // =============================
 
 func (s *Server) handleListRooms(w http.ResponseWriter, r *http.Request) {
-	rooms, err := s.repo.ListRooms(r.Context())
+	rooms, err := s.nttRepo.ListRooms(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal server error")
 		return
@@ -286,6 +298,12 @@ func (s *Server) handleListRooms(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"rooms": out})
 }
 
+func (s *Server) handleListGames(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"games": games.List(),
+	})
+}
+
 func (s *Server) handleCreateRoom(w http.ResponseWriter, r *http.Request) {
 	type reqBody struct {
 		Name string `json:"name"`
@@ -296,7 +314,7 @@ func (s *Server) handleCreateRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	roomID, err := s.repo.CreateRoom(r.Context(), userSub(r), strings.TrimSpace(body.Name))
+	roomID, err := s.nttRepo.CreateRoom(r.Context(), userSub(r), strings.TrimSpace(body.Name))
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -311,7 +329,7 @@ func (s *Server) handleCreateRoom(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetRoom(w http.ResponseWriter, r *http.Request) {
 	roomID := roomIDParam(r)
-	snap, err := s.repo.GetRoomSnapshot(r.Context(), roomID)
+	snap, err := s.nttRepo.GetRoomSnapshot(r.Context(), roomID)
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -334,14 +352,14 @@ func (s *Server) handleJoinRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	playerID, err := s.repo.JoinRoom(r.Context(), roomID, userSub(r), strings.TrimSpace(body.Nickname), strings.TrimSpace(body.PictureURL))
+	playerID, err := s.nttRepo.JoinRoom(r.Context(), roomID, userSub(r), strings.TrimSpace(body.Nickname), strings.TrimSpace(body.PictureURL))
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
 		return
 	}
 
-	snap, err := s.repo.GetRoomSnapshot(r.Context(), roomID)
+	snap, err := s.nttRepo.GetRoomSnapshot(r.Context(), roomID)
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -369,7 +387,7 @@ func (s *Server) handleLeaveRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.repo.LeaveRoom(r.Context(), roomID, strings.TrimSpace(body.PlayerID)); err != nil {
+	if err := s.nttRepo.LeaveRoom(r.Context(), roomID, strings.TrimSpace(body.PlayerID)); err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
 		return
@@ -395,13 +413,13 @@ func (s *Server) handleKick(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.repo.KickPlayer(r.Context(), roomID, userSub(r), strings.TrimSpace(body.PlayerID)); err != nil {
+	if err := s.nttRepo.KickPlayer(r.Context(), roomID, userSub(r), strings.TrimSpace(body.PlayerID)); err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
 		return
 	}
 
-	snap, err := s.repo.GetRoomSnapshot(r.Context(), roomID)
+	snap, err := s.nttRepo.GetRoomSnapshot(r.Context(), roomID)
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -425,13 +443,13 @@ func (s *Server) handleScoreSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.repo.SetScore(r.Context(), roomID, userSub(r), strings.TrimSpace(body.PlayerID), body.Score); err != nil {
+	if err := s.nttRepo.SetScore(r.Context(), roomID, userSub(r), strings.TrimSpace(body.PlayerID), body.Score); err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
 		return
 	}
 
-	snap, err := s.repo.GetRoomSnapshot(r.Context(), roomID)
+	snap, err := s.nttRepo.GetRoomSnapshot(r.Context(), roomID)
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -455,13 +473,13 @@ func (s *Server) handleScoreAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.repo.AddScore(r.Context(), roomID, userSub(r), strings.TrimSpace(body.PlayerID), body.Delta); err != nil {
+	if err := s.nttRepo.AddScore(r.Context(), roomID, userSub(r), strings.TrimSpace(body.PlayerID), body.Delta); err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
 		return
 	}
 
-	snap, err := s.repo.GetRoomSnapshot(r.Context(), roomID)
+	snap, err := s.nttRepo.GetRoomSnapshot(r.Context(), roomID)
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -484,13 +502,13 @@ func (s *Server) handleLoadPlaylist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.repo.LoadPlaylistToRoom(r.Context(), roomID, userSub(r), strings.TrimSpace(body.PlaylistID)); err != nil {
+	if err := s.nttRepo.LoadPlaylistToRoom(r.Context(), roomID, userSub(r), strings.TrimSpace(body.PlaylistID)); err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
 		return
 	}
 
-	snap, err := s.repo.GetRoomSnapshot(r.Context(), roomID)
+	snap, err := s.nttRepo.GetRoomSnapshot(r.Context(), roomID)
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -516,13 +534,13 @@ func (s *Server) handlePlaybackSet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// track index is mandatory in this endpoint
-	if err := s.repo.SetPlayback(r.Context(), roomID, userSub(r), body.TrackIndex, body.Paused, body.PositionMS); err != nil {
+	if err := s.nttRepo.SetPlayback(r.Context(), roomID, userSub(r), body.TrackIndex, body.Paused, body.PositionMS); err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
 		return
 	}
 
-	snap, err := s.repo.GetRoomSnapshot(r.Context(), roomID)
+	snap, err := s.nttRepo.GetRoomSnapshot(r.Context(), roomID)
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -545,13 +563,13 @@ func (s *Server) handlePlaybackPause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.repo.TogglePauseSafe(r.Context(), roomID, userSub(r), body.Paused); err != nil {
+	if err := s.nttRepo.TogglePauseSafe(r.Context(), roomID, userSub(r), body.Paused); err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
 		return
 	}
 
-	snap, err := s.repo.GetRoomSnapshot(r.Context(), roomID)
+	snap, err := s.nttRepo.GetRoomSnapshot(r.Context(), roomID)
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -574,13 +592,13 @@ func (s *Server) handlePlaybackSeek(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.repo.Seek(r.Context(), roomID, userSub(r), body.PositionMS); err != nil {
+	if err := s.nttRepo.Seek(r.Context(), roomID, userSub(r), body.PositionMS); err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
 		return
 	}
 
-	snap, err := s.repo.GetRoomSnapshot(r.Context(), roomID)
+	snap, err := s.nttRepo.GetRoomSnapshot(r.Context(), roomID)
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -610,9 +628,9 @@ func (s *Server) handleBuzz(w http.ResponseWriter, r *http.Request) {
 	// We don't persist buzzes in DB yet; just broadcast the event.
 	if s.rt != nil {
 		// Best-effort include player info by fetching snapshot and matching playerId.
-		snap, err := s.repo.GetRoomSnapshot(r.Context(), roomID)
+		snap, err := s.nttRepo.GetRoomSnapshot(r.Context(), roomID)
 		if err == nil {
-			var pv *game.PlayerView
+			var pv *namethattune.PlayerView
 			for i := range snap.Players {
 				if snap.Players[i].PlayerID == strings.TrimSpace(body.PlayerID) {
 					pv = &snap.Players[i]
@@ -646,7 +664,7 @@ func (s *Server) handleBuzz(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetMe(w http.ResponseWriter, r *http.Request) {
 	sub := userSub(r)
-	p, err := s.repo.GetProfile(r.Context(), sub)
+	p, err := s.coreRepo.GetProfile(r.Context(), sub)
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -668,7 +686,7 @@ func (s *Server) handlePutMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p, err := s.repo.UpsertProfile(r.Context(), sub, strings.TrimSpace(body.Nickname), strings.TrimSpace(body.PictureURL))
+	p, err := s.coreRepo.UpsertProfile(r.Context(), sub, strings.TrimSpace(body.Nickname), strings.TrimSpace(body.PictureURL))
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -680,7 +698,13 @@ func (s *Server) handlePutMe(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteMe(w http.ResponseWriter, r *http.Request) {
 	sub := userSub(r)
 
-	if err := s.repo.DeleteAccount(r.Context(), sub); err != nil {
+	if err := s.nttRepo.CleanupUserData(r.Context(), sub); err != nil {
+		status, msg := mapDomainErr(err)
+		writeError(w, status, msg)
+		return
+	}
+
+	if err := s.coreRepo.DeleteAccount(r.Context(), sub); err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
 		return
@@ -693,10 +717,10 @@ func (s *Server) handleDeleteMe(w http.ResponseWriter, r *http.Request) {
 // REST handlers: Playlists
 // =============================
 
-func (s *Server) handleListMyPlaylists(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleListPlaylists(w http.ResponseWriter, r *http.Request) {
 	sub := userSub(r)
 
-	pls, err := s.repo.ListPlaylists(r.Context(), sub)
+	pls, err := s.nttRepo.ListPlaylists(r.Context(), sub)
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -705,9 +729,9 @@ func (s *Server) handleListMyPlaylists(w http.ResponseWriter, r *http.Request) {
 
 	// For the UI, include items as well (so it can show tracks).
 	// This is N+1; acceptable for now. If needed, add a "list playlists with items" query.
-	out := make([]game.Playlist, 0, len(pls))
+	out := make([]namethattune.Playlist, 0, len(pls))
 	for _, pl := range pls {
-		full, err := s.repo.GetPlaylist(r.Context(), sub, pl.ID)
+		full, err := s.nttRepo.GetPlaylist(r.Context(), sub, pl.ID)
 		if err != nil {
 			// If a playlist disappeared between list and get, just skip it.
 			continue
@@ -718,7 +742,7 @@ func (s *Server) handleListMyPlaylists(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"playlists": out})
 }
 
-func (s *Server) handleCreateMyPlaylist(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleCreatePlaylist(w http.ResponseWriter, r *http.Request) {
 	sub := userSub(r)
 
 	type reqBody struct {
@@ -730,7 +754,7 @@ func (s *Server) handleCreateMyPlaylist(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	pl, err := s.repo.CreatePlaylist(r.Context(), sub, strings.TrimSpace(body.Name))
+	pl, err := s.nttRepo.CreatePlaylist(r.Context(), sub, strings.TrimSpace(body.Name))
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -740,7 +764,7 @@ func (s *Server) handleCreateMyPlaylist(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusCreated, pl)
 }
 
-func (s *Server) handlePatchMyPlaylist(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handlePatchPlaylist(w http.ResponseWriter, r *http.Request) {
 	sub := userSub(r)
 	playlistID := playlistIDParam(r)
 
@@ -758,7 +782,7 @@ func (s *Server) handlePatchMyPlaylist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pl, err := s.repo.UpdatePlaylistName(r.Context(), sub, playlistID, strings.TrimSpace(*body.Name))
+	pl, err := s.nttRepo.UpdatePlaylistName(r.Context(), sub, playlistID, strings.TrimSpace(*body.Name))
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -768,7 +792,7 @@ func (s *Server) handlePatchMyPlaylist(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, pl)
 }
 
-func (s *Server) handleAddMyPlaylistItem(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAddPlaylistItem(w http.ResponseWriter, r *http.Request) {
 	sub := userSub(r)
 	playlistID := playlistIDParam(r)
 
@@ -782,7 +806,7 @@ func (s *Server) handleAddMyPlaylistItem(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	item, pl, err := s.repo.AddPlaylistItem(r.Context(), sub, playlistID, strings.TrimSpace(body.Title), strings.TrimSpace(body.YouTubeURL))
+	item, pl, err := s.nttRepo.AddPlaylistItem(r.Context(), sub, playlistID, strings.TrimSpace(body.Title), strings.TrimSpace(body.YouTubeURL))
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -852,7 +876,7 @@ func (s *Server) handleRoomWS(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = c.Close(websocket.StatusNormalClosure, "bye") }()
 
 	// Send initial snapshot.
-	snap, err := s.repo.GetRoomSnapshot(r.Context(), roomID)
+	snap, err := s.nttRepo.GetRoomSnapshot(r.Context(), roomID)
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		_ = c.Close(websocket.StatusPolicyViolation, msg)

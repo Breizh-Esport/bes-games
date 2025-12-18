@@ -1,4 +1,4 @@
-package game
+package namethattune
 
 import (
 	"context"
@@ -8,9 +8,11 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/valentin/bes-games/backend/internal/core"
 )
 
-// Repo provides a Postgres-backed repository for profiles, playlists, rooms, and players.
+// Repo provides a Postgres-backed repository for Name That Tune state:
+// playlists, rooms, players, and playback.
 //
 // This repository is intentionally "thin":
 // - It persists and queries state in Postgres.
@@ -33,108 +35,44 @@ func NewRepo(db *pgxpool.Pool) *Repo {
 	return &Repo{db: db}
 }
 
-// ============================
-// Errors (repo-level)
-// ============================
-
-var (
-	ErrNotFound      = errors.New("not found")
-	ErrConflict      = errors.New("conflict")
-	ErrForeignKey    = errors.New("foreign key violation")
-	ErrAlreadyExists = errors.New("already exists")
-)
-
-// ============================
-// Profiles / Accounts
-// ============================
-
-// UpsertProfile creates or updates a user profile.
-// If the user doesn't exist, it is created.
-// If it exists and was soft-deleted (deleted_at != NULL), it is "revived".
-func (r *Repo) UpsertProfile(ctx context.Context, sub, nickname, pictureURL string) (UserProfile, error) {
+func (r *Repo) ensureUserExists(ctx context.Context, sub string) error {
 	if sub == "" {
-		return UserProfile{}, ErrUnauthorized
-	}
-	if nickname == "" {
-		nickname = "Player"
+		return core.ErrUnauthorized
 	}
 
 	const q = `
 INSERT INTO users (sub, nickname, picture_url, deleted_at)
-VALUES ($1, $2, $3, NULL)
+VALUES ($1, 'Player', '', NULL)
 ON CONFLICT (sub) DO UPDATE
-SET nickname = EXCLUDED.nickname,
-    picture_url = EXCLUDED.picture_url,
-    deleted_at = NULL
-RETURNING sub, nickname, picture_url, updated_at;
+SET deleted_at = NULL
+WHERE users.deleted_at IS NOT NULL;
 `
-	var out UserProfile
-	if err := r.db.QueryRow(ctx, q, sub, nickname, pictureURL).Scan(&out.Sub, &out.Nickname, &out.PictureURL, &out.UpdatedAt); err != nil {
-		return UserProfile{}, fmt.Errorf("upsert profile: %w", err)
+	if _, err := r.db.Exec(ctx, q, sub); err != nil {
+		return fmt.Errorf("ensure user exists: %w", err)
 	}
-	return out, nil
+	return nil
 }
 
-// GetProfile returns the user profile. If it doesn't exist, returns a default profile (not created).
-func (r *Repo) GetProfile(ctx context.Context, sub string) (UserProfile, error) {
-	if sub == "" {
-		return UserProfile{}, ErrUnauthorized
-	}
-
-	const q = `
-SELECT sub, nickname, picture_url, updated_at
-FROM users
-WHERE sub = $1 AND deleted_at IS NULL;
-`
-	var out UserProfile
-	err := r.db.QueryRow(ctx, q, sub).Scan(&out.Sub, &out.Nickname, &out.PictureURL, &out.UpdatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return UserProfile{
-			Sub:       sub,
-			Nickname:  "Player",
-			UpdatedAt: time.Now().UTC(),
-		}, nil
-	}
-	if err != nil {
-		return UserProfile{}, fmt.Errorf("get profile: %w", err)
-	}
-	return out, nil
-}
-
-// DeleteAccount soft-deletes the user row. Cascades:
-// - playlists(owner_sub) ON DELETE CASCADE will NOT fire on soft delete, so we soft-delete playlists explicitly.
-// - room ownership is restricted by FK; we keep the room rows as-is.
-// - room_players.user_sub is set NULL on delete; again on soft delete it won't fire; we scrub players explicitly.
+// CleanupUserData removes/neutralizes Name That Tune state owned by the given user.
 //
-// If you want hard deletes, change users.deleted_at semantics and run DELETE.
-func (r *Repo) DeleteAccount(ctx context.Context, sub string) error {
+// This is intentionally separate from core.Repo.DeleteAccount because soft deletes do not
+// trigger FK ON DELETE actions, and each game can have its own cleanup logic.
+func (r *Repo) CleanupUserData(ctx context.Context, sub string) error {
 	if sub == "" {
-		return ErrUnauthorized
+		return core.ErrUnauthorized
 	}
 
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return fmt.Errorf("delete account begin: %w", err)
+		return fmt.Errorf("cleanup user begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-
-	// Soft-delete user.
-	{
-		const q = `UPDATE users SET deleted_at = now() WHERE sub = $1 AND deleted_at IS NULL;`
-		ct, err := tx.Exec(ctx, q, sub)
-		if err != nil {
-			return fmt.Errorf("delete account: %w", err)
-		}
-		if ct.RowsAffected() == 0 {
-			// idempotent
-		}
-	}
 
 	// Soft-delete playlists owned by user.
 	{
 		const q = `UPDATE playlists SET deleted_at = now() WHERE owner_sub = $1 AND deleted_at IS NULL;`
 		if _, err := tx.Exec(ctx, q, sub); err != nil {
-			return fmt.Errorf("delete account soft-delete playlists: %w", err)
+			return fmt.Errorf("cleanup user soft-delete playlists: %w", err)
 		}
 	}
 
@@ -150,14 +88,13 @@ SET connected = FALSE,
 WHERE user_sub = $1;
 `
 		if _, err := tx.Exec(ctx, q, sub); err != nil {
-			return fmt.Errorf("delete account scrub room_players: %w", err)
+			return fmt.Errorf("cleanup user scrub room_players: %w", err)
 		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("delete account commit: %w", err)
+		return fmt.Errorf("cleanup user commit: %w", err)
 	}
-
 	return nil
 }
 
@@ -171,15 +108,15 @@ type DBPlaylist = Playlist
 
 func (r *Repo) CreatePlaylist(ctx context.Context, ownerSub, name string) (Playlist, error) {
 	if ownerSub == "" {
-		return Playlist{}, ErrUnauthorized
+		return Playlist{}, core.ErrUnauthorized
 	}
 	if name == "" {
-		return Playlist{}, ErrInvalidInput
+		return Playlist{}, core.ErrInvalidInput
 	}
 
 	// Ensure user exists (FK). We choose to auto-create a default profile row if missing.
 	// This makes "first action is create playlist" work even if /api/me wasn't called.
-	if _, err := r.UpsertProfile(ctx, ownerSub, "Player", ""); err != nil {
+	if err := r.ensureUserExists(ctx, ownerSub); err != nil {
 		return Playlist{}, err
 	}
 
@@ -198,7 +135,7 @@ RETURNING id::text, owner_sub, name, created_at, updated_at;
 
 func (r *Repo) ListPlaylists(ctx context.Context, ownerSub string) ([]Playlist, error) {
 	if ownerSub == "" {
-		return nil, ErrUnauthorized
+		return nil, core.ErrUnauthorized
 	}
 
 	const q = `
@@ -231,10 +168,10 @@ ORDER BY p.updated_at DESC;
 
 func (r *Repo) GetPlaylist(ctx context.Context, ownerSub, playlistID string) (Playlist, error) {
 	if ownerSub == "" {
-		return Playlist{}, ErrUnauthorized
+		return Playlist{}, core.ErrUnauthorized
 	}
 	if playlistID == "" {
-		return Playlist{}, ErrInvalidInput
+		return Playlist{}, core.ErrInvalidInput
 	}
 
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
@@ -274,10 +211,10 @@ WHERE id::uuid = $1 AND owner_sub = $2 AND deleted_at IS NULL;
 
 func (r *Repo) UpdatePlaylistName(ctx context.Context, ownerSub, playlistID, name string) (Playlist, error) {
 	if ownerSub == "" {
-		return Playlist{}, ErrUnauthorized
+		return Playlist{}, core.ErrUnauthorized
 	}
 	if playlistID == "" || name == "" {
-		return Playlist{}, ErrInvalidInput
+		return Playlist{}, core.ErrInvalidInput
 	}
 
 	const q = `
@@ -305,15 +242,15 @@ RETURNING id::text, owner_sub, name, created_at, updated_at;
 
 func (r *Repo) AddPlaylistItem(ctx context.Context, ownerSub, playlistID, title, youtubeURL string) (PlaylistItem, Playlist, error) {
 	if ownerSub == "" {
-		return PlaylistItem{}, Playlist{}, ErrUnauthorized
+		return PlaylistItem{}, Playlist{}, core.ErrUnauthorized
 	}
 	if playlistID == "" || title == "" || youtubeURL == "" {
-		return PlaylistItem{}, Playlist{}, ErrInvalidInput
+		return PlaylistItem{}, Playlist{}, core.ErrInvalidInput
 	}
 
-	yid, err := extractYouTubeID(youtubeURL)
+	yid, err := ExtractYouTubeID(youtubeURL)
 	if err != nil {
-		return PlaylistItem{}, Playlist{}, err
+		return PlaylistItem{}, Playlist{}, fmt.Errorf("%w: %s", core.ErrInvalidInput, err.Error())
 	}
 
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
@@ -385,10 +322,10 @@ RETURNING id::text, title, youtube_url, youtube_id, duration_sec, created_at;
 
 func (r *Repo) ListPlaylistItems(ctx context.Context, ownerSub, playlistID string) ([]PlaylistItem, error) {
 	if ownerSub == "" {
-		return nil, ErrUnauthorized
+		return nil, core.ErrUnauthorized
 	}
 	if playlistID == "" {
-		return nil, ErrInvalidInput
+		return nil, core.ErrInvalidInput
 	}
 
 	// Authorization: ensure playlist belongs to owner.
@@ -473,14 +410,14 @@ type DBRoomInfo struct {
 // CreateRoom creates a room and ensures the owner exists in users.
 func (r *Repo) CreateRoom(ctx context.Context, ownerSub, name string) (string, error) {
 	if ownerSub == "" {
-		return "", ErrUnauthorized
+		return "", core.ErrUnauthorized
 	}
 	if name == "" {
 		name = "Room"
 	}
 
 	// Ensure owner exists in users.
-	if _, err := r.UpsertProfile(ctx, ownerSub, "Player", ""); err != nil {
+	if err := r.ensureUserExists(ctx, ownerSub); err != nil {
 		return "", err
 	}
 
@@ -531,7 +468,7 @@ ORDER BY rm.updated_at DESC;
 
 func (r *Repo) GetRoomSnapshot(ctx context.Context, roomID string) (RoomSnapshot, error) {
 	if roomID == "" {
-		return RoomSnapshot{}, ErrInvalidInput
+		return RoomSnapshot{}, core.ErrInvalidInput
 	}
 
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
@@ -560,7 +497,7 @@ WHERE id::uuid = $1;
 			&snap.Playback.UpdatedAt,
 		)
 		if errors.Is(err, pgx.ErrNoRows) {
-			return RoomSnapshot{}, ErrRoomNotFound
+			return RoomSnapshot{}, core.ErrRoomNotFound
 		}
 		if err != nil {
 			return RoomSnapshot{}, fmt.Errorf("get room: %w", err)
@@ -654,25 +591,28 @@ WHERE id::uuid = $1 AND deleted_at IS NULL;
 // JoinRoom inserts a room_players row and returns playerId.
 func (r *Repo) JoinRoom(ctx context.Context, roomID, userSub, nickname, pictureURL string) (string, error) {
 	if roomID == "" {
-		return "", ErrInvalidInput
-	}
-	if nickname == "" {
-		nickname = "Anonymous"
+		return "", core.ErrInvalidInput
 	}
 
 	// If userSub is provided, ensure user exists. Also, use stored profile as defaults.
 	if userSub != "" {
-		prof, err := r.GetProfile(ctx, userSub)
+		if err := r.ensureUserExists(ctx, userSub); err != nil {
+			return "", err
+		}
+
+		profNick, profPic, err := r.profileDefaults(ctx, userSub)
 		if err != nil {
 			return "", err
 		}
-		if nickname == "" || nickname == "Anonymous" {
-			// If caller didn't supply, use profile nickname.
-			nickname = prof.Nickname
+
+		if nickname == "" {
+			nickname = profNick
 		}
 		if pictureURL == "" {
-			pictureURL = prof.PictureURL
+			pictureURL = profPic
 		}
+	} else if nickname == "" {
+		nickname = "Anonymous"
 	}
 
 	const q = `
@@ -688,9 +628,29 @@ RETURNING id::text;
 	return playerID, nil
 }
 
+func (r *Repo) profileDefaults(ctx context.Context, sub string) (string, string, error) {
+	const q = `
+SELECT nickname, picture_url
+FROM users
+WHERE sub = $1 AND deleted_at IS NULL;
+`
+	var nick, pic string
+	err := r.db.QueryRow(ctx, q, sub).Scan(&nick, &pic)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "Player", "", nil
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("load profile defaults: %w", err)
+	}
+	if nick == "" {
+		nick = "Player"
+	}
+	return nick, pic, nil
+}
+
 func (r *Repo) LeaveRoom(ctx context.Context, roomID, playerID string) error {
 	if roomID == "" || playerID == "" {
-		return ErrInvalidInput
+		return core.ErrInvalidInput
 	}
 
 	const q = `
@@ -704,14 +664,14 @@ WHERE id::uuid = $1 AND room_id::uuid = $2;
 		return fmt.Errorf("leave room: %w", err)
 	}
 	if ct.RowsAffected() == 0 {
-		return ErrPlayerNotFound
+		return core.ErrPlayerNotFound
 	}
 	return nil
 }
 
 func (r *Repo) KickPlayer(ctx context.Context, roomID, ownerSub, playerID string) error {
 	if roomID == "" || ownerSub == "" || playerID == "" {
-		return ErrInvalidInput
+		return core.ErrInvalidInput
 	}
 
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
@@ -724,7 +684,7 @@ func (r *Repo) KickPlayer(ctx context.Context, roomID, ownerSub, playerID string
 	if ok, err := r.isRoomOwnerTx(ctx, tx, roomID, ownerSub); err != nil {
 		return err
 	} else if !ok {
-		return ErrNotOwner
+		return core.ErrNotOwner
 	}
 
 	const q = `DELETE FROM room_players WHERE id::uuid = $1 AND room_id::uuid = $2;`
@@ -733,7 +693,7 @@ func (r *Repo) KickPlayer(ctx context.Context, roomID, ownerSub, playerID string
 		return fmt.Errorf("kick: %w", err)
 	}
 	if ct.RowsAffected() == 0 {
-		return ErrPlayerNotFound
+		return core.ErrPlayerNotFound
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -744,7 +704,7 @@ func (r *Repo) KickPlayer(ctx context.Context, roomID, ownerSub, playerID string
 
 func (r *Repo) SetScore(ctx context.Context, roomID, ownerSub, playerID string, score int) error {
 	if roomID == "" || ownerSub == "" || playerID == "" {
-		return ErrInvalidInput
+		return core.ErrInvalidInput
 	}
 
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
@@ -756,7 +716,7 @@ func (r *Repo) SetScore(ctx context.Context, roomID, ownerSub, playerID string, 
 	if ok, err := r.isRoomOwnerTx(ctx, tx, roomID, ownerSub); err != nil {
 		return err
 	} else if !ok {
-		return ErrNotOwner
+		return core.ErrNotOwner
 	}
 
 	const q = `
@@ -769,7 +729,7 @@ WHERE id::uuid = $1 AND room_id::uuid = $2;
 		return fmt.Errorf("set score: %w", err)
 	}
 	if ct.RowsAffected() == 0 {
-		return ErrPlayerNotFound
+		return core.ErrPlayerNotFound
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -780,7 +740,7 @@ WHERE id::uuid = $1 AND room_id::uuid = $2;
 
 func (r *Repo) AddScore(ctx context.Context, roomID, ownerSub, playerID string, delta int) error {
 	if roomID == "" || ownerSub == "" || playerID == "" {
-		return ErrInvalidInput
+		return core.ErrInvalidInput
 	}
 
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
@@ -792,7 +752,7 @@ func (r *Repo) AddScore(ctx context.Context, roomID, ownerSub, playerID string, 
 	if ok, err := r.isRoomOwnerTx(ctx, tx, roomID, ownerSub); err != nil {
 		return err
 	} else if !ok {
-		return ErrNotOwner
+		return core.ErrNotOwner
 	}
 
 	const q = `
@@ -805,7 +765,7 @@ WHERE id::uuid = $1 AND room_id::uuid = $2;
 		return fmt.Errorf("add score: %w", err)
 	}
 	if ct.RowsAffected() == 0 {
-		return ErrPlayerNotFound
+		return core.ErrPlayerNotFound
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -816,7 +776,7 @@ WHERE id::uuid = $1 AND room_id::uuid = $2;
 
 func (r *Repo) LoadPlaylistToRoom(ctx context.Context, roomID, ownerSub, playlistID string) error {
 	if roomID == "" || ownerSub == "" || playlistID == "" {
-		return ErrInvalidInput
+		return core.ErrInvalidInput
 	}
 
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
@@ -828,7 +788,7 @@ func (r *Repo) LoadPlaylistToRoom(ctx context.Context, roomID, ownerSub, playlis
 	if ok, err := r.isRoomOwnerTx(ctx, tx, roomID, ownerSub); err != nil {
 		return err
 	} else if !ok {
-		return ErrNotOwner
+		return core.ErrNotOwner
 	}
 
 	// Ensure playlist belongs to owner and isn't deleted.
@@ -859,7 +819,7 @@ WHERE id::uuid = $1 AND owner_sub = $2;
 		return fmt.Errorf("load playlist update room: %w", err)
 	}
 	if ct.RowsAffected() == 0 {
-		return ErrNotOwner
+		return core.ErrNotOwner
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -870,7 +830,7 @@ WHERE id::uuid = $1 AND owner_sub = $2;
 
 func (r *Repo) SetPlayback(ctx context.Context, roomID, ownerSub string, trackIndex int, paused *bool, positionMS *int) error {
 	if roomID == "" || ownerSub == "" {
-		return ErrInvalidInput
+		return core.ErrInvalidInput
 	}
 
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
@@ -883,7 +843,7 @@ func (r *Repo) SetPlayback(ctx context.Context, roomID, ownerSub string, trackIn
 	if ok, err := r.isRoomOwnerTx(ctx, tx, roomID, ownerSub); err != nil {
 		return err
 	} else if !ok {
-		return ErrNotOwner
+		return core.ErrNotOwner
 	}
 
 	// Ensure there is a loaded playlist, and validate track index within range.
@@ -892,12 +852,12 @@ func (r *Repo) SetPlayback(ctx context.Context, roomID, ownerSub string, trackIn
 		const q = `SELECT loaded_playlist_id::text FROM rooms WHERE id::uuid = $1 FOR UPDATE;`
 		if err := tx.QueryRow(ctx, q, roomID).Scan(&loadedPlaylistID); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return ErrRoomNotFound
+				return core.ErrRoomNotFound
 			}
 			return fmt.Errorf("set playback load room: %w", err)
 		}
 		if loadedPlaylistID == nil || *loadedPlaylistID == "" {
-			return ErrInvalidInput
+			return core.ErrInvalidInput
 		}
 	}
 	{
@@ -907,7 +867,7 @@ func (r *Repo) SetPlayback(ctx context.Context, roomID, ownerSub string, trackIn
 			return fmt.Errorf("set playback count tracks: %w", err)
 		}
 		if trackIndex < 0 || trackIndex >= cnt {
-			return ErrInvalidInput
+			return core.ErrInvalidInput
 		}
 	}
 
@@ -923,7 +883,7 @@ func (r *Repo) SetPlayback(ctx context.Context, roomID, ownerSub string, trackIn
 	posVal := "playback_position_ms"
 	if positionMS != nil {
 		if *positionMS < 0 {
-			return ErrInvalidInput
+			return core.ErrInvalidInput
 		}
 		posVal = fmt.Sprintf("%d", *positionMS)
 	}
@@ -980,7 +940,7 @@ func (r *Repo) TogglePause(ctx context.Context, roomID, ownerSub string, paused 
 // TogglePauseSafe toggles pause without changing track index. Prefer this over TogglePause.
 func (r *Repo) TogglePauseSafe(ctx context.Context, roomID, ownerSub string, paused bool) error {
 	if roomID == "" || ownerSub == "" {
-		return ErrInvalidInput
+		return core.ErrInvalidInput
 	}
 
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
@@ -992,7 +952,7 @@ func (r *Repo) TogglePauseSafe(ctx context.Context, roomID, ownerSub string, pau
 	if ok, err := r.isRoomOwnerTx(ctx, tx, roomID, ownerSub); err != nil {
 		return err
 	} else if !ok {
-		return ErrNotOwner
+		return core.ErrNotOwner
 	}
 
 	const q = `
@@ -1006,7 +966,7 @@ WHERE id::uuid = $1 AND owner_sub = $2;
 		return fmt.Errorf("toggle pause: %w", err)
 	}
 	if ct.RowsAffected() == 0 {
-		return ErrRoomNotFound
+		return core.ErrRoomNotFound
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -1017,7 +977,7 @@ WHERE id::uuid = $1 AND owner_sub = $2;
 
 func (r *Repo) Seek(ctx context.Context, roomID, ownerSub string, positionMS int) error {
 	if roomID == "" || ownerSub == "" || positionMS < 0 {
-		return ErrInvalidInput
+		return core.ErrInvalidInput
 	}
 
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
@@ -1029,7 +989,7 @@ func (r *Repo) Seek(ctx context.Context, roomID, ownerSub string, positionMS int
 	if ok, err := r.isRoomOwnerTx(ctx, tx, roomID, ownerSub); err != nil {
 		return err
 	} else if !ok {
-		return ErrNotOwner
+		return core.ErrNotOwner
 	}
 
 	const q = `
@@ -1043,7 +1003,7 @@ WHERE id::uuid = $1 AND owner_sub = $2;
 		return fmt.Errorf("seek: %w", err)
 	}
 	if ct.RowsAffected() == 0 {
-		return ErrRoomNotFound
+		return core.ErrRoomNotFound
 	}
 
 	if err := tx.Commit(ctx); err != nil {

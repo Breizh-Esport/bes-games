@@ -1,80 +1,35 @@
-# bes-blind
+# bes-games
 
-"Name That Tune" (blindtest) web app.
+Multi-game platform (initial game: "Name That Tune" / blindtest).
 
 This repository contains:
 - Go backend (`backend/`) providing a REST + WebSocket API
-- Vue.js frontend (`frontend/`) providing a multi-page UI (Home, Profile, Room)
+- Vue 3 frontend (`frontend/`) providing a multi-page UI (Games, Profile, per-game pages)
 
-> Note on authentication: the long-term plan is **OIDC login/registration**.
-> Right now the frontend uses a **temporary placeholder** that stores an arbitrary `sub` in `localStorage` and sends it to the backend via `X-User-Sub`.
-> Anonymous users can still join rooms.
-
----
+Authentication is currently a placeholder:
+- The frontend stores an arbitrary `sub` in `localStorage`
+- Authenticated backend requests send it via `X-User-Sub`
 
 ## Project layout
 
-- `backend/cmd/api/` — Go server entrypoint
-- `backend/internal/game/` — in-memory domain/state (rooms, players, playlists, events)
-- `backend/internal/httpapi/` — REST + WebSocket handlers (Chi router)
-- `frontend/` — Vue app (Vue Router pages)
-
----
-
-## Features implemented (current)
-
-### Home page
-- "Login" placeholder (set a `sub` string locally)
-- Create a room (**requires auth**)
-- List rooms (shows online player count best-effort)
-- Join a room (**anonymous allowed**)
-
-### Profile page (auth required)
-- Modify nickname and profile picture (stored server-side, in-memory)
-- Create/list/rename playlists
-- Add tracks to playlists by providing:
-  - track title
-  - YouTube URL (parsed to extract YouTube ID)
-- Delete account (removes profile; best-effort scrubbing of presence)
-
-### Room page
-- Live room roster via WebSocket (`room.snapshot` + events)
-- Owner view (derived from `sub === ownerSub`):
-  - see players (name, picture, score, online/offline)
-  - kick players
-  - increase/decrease score, set score
-  - load one of your playlists into the room
-  - control playback state (track index, pause/play, seek, next/prev/restart)
-- Player view:
-  - see players (name, picture, score)
-  - local volume slider (UI only)
-  - buzzer (sends event to the room)
-
-> Audio playback: YouTube embedded playback is **not implemented yet**.
-> Playback controls currently synchronize **state** to all clients.
-
----
+- `backend/cmd/api/` - Go server entrypoint
+- `backend/internal/core/` - core domain + Postgres repo (profiles, shared domain errors)
+- `backend/internal/games/` - game registry + game-specific packages
+- `backend/internal/games/namethattune/` - Name That Tune domain + Postgres repo (rooms, playback, playlists)
+- `backend/internal/httpapi/` - REST + WebSocket handlers (Chi router)
+- `frontend/src/views/` - platform + per-game pages (games live under `frontend/src/views/games/`)
 
 ## Run instructions
 
 ### Backend (Go)
-From repo root:
 
-```sh
-go run ./backend/cmd/api
-```
-
-The server listens on:
-- `BES_ADDR` (default `:8080`)
-
-CORS:
-- Default allowed origin: `http://localhost:5173`
-- Override with `BES_CORS_ALLOWED_ORIGINS` (comma-separated)
+Requires Postgres (`DATABASE_URL` or `BES_DATABASE_URL`). By default, Goose migrations run on startup
+(disable with `BES_MIGRATIONS_DISABLE=1`).
 
 Example:
 
 ```sh
-BES_ADDR=":8080" BES_CORS_ALLOWED_ORIGINS="http://localhost:5173" go run ./backend/cmd/api
+DATABASE_URL="postgres://postgres:postgres@localhost:5432/bes_games?sslmode=disable" go run ./backend/cmd/api
 ```
 
 Health check:
@@ -84,7 +39,6 @@ curl http://localhost:8080/healthz
 ```
 
 ### Frontend (Vue)
-From repo root:
 
 ```sh
 cd frontend
@@ -92,111 +46,26 @@ npm install
 npm run dev
 ```
 
-The frontend can be pointed at a different backend URL using:
-
+Override backend base URL:
 - `VITE_API_BASE_URL` (defaults to `http://localhost:8080`)
 
-Example (PowerShell):
-
-```powershell
-$env:VITE_API_BASE_URL="http://localhost:8080"
-npm run dev
-```
-
-Example (sh):
+### Docker
 
 ```sh
-VITE_API_BASE_URL="http://localhost:8080" npm run dev
+docker compose up --build
 ```
 
-Build:
+## Backend API (high-level)
 
-```sh
-cd frontend
-npm run build
-npm run preview
-```
-
----
-
-## Backend API
-
-### Authentication (temporary)
-For endpoints that require authentication, the backend expects:
-
-- `X-User-Sub: <oidc subject>`
-
-Anonymous users can call endpoints that do not require auth.
-
-### REST endpoints
-
-#### Health
 - `GET /healthz`
+- `GET /api/games` - list available games (currently only `name-that-tune`)
+- Rooms (per-game): `GET /api/games/{gameId}/rooms`, `POST /api/games/{gameId}/rooms`, `GET /api/games/{gameId}/rooms/{roomId}`, join/leave, WS snapshots
+- Profile: `GET/PUT/DELETE /api/me`
+- Playlists (per-game): `GET/POST/PATCH /api/games/{gameId}/playlists`, `POST /api/games/{gameId}/playlists/{playlistId}/items`
 
-#### Rooms
-- `GET  /api/rooms`
-  - List available rooms, with online player counts (best-effort).
-- `POST /api/rooms` (**auth required**)
-  - Create room
-  - Body: `{ "name": "My Room" }`
-- `GET  /api/rooms/{roomId}`
-  - Fetch a `RoomSnapshot`
-- `POST /api/rooms/{roomId}/join` (anonymous allowed)
-  - Body (optional): `{ "nickname": "...", "pictureUrl": "https://..." }`
-  - Returns: `{ playerId, snapshot }`
-- `POST /api/rooms/{roomId}/leave`
-  - Body: `{ "playerId": "..." }`
+## Next steps
 
-#### Room owner controls (must be room owner; auth required)
-- `POST /api/rooms/{roomId}/kick`
-  - Body: `{ "playerId": "..." }`
-- `POST /api/rooms/{roomId}/score/set`
-  - Body: `{ "playerId": "...", "score": 10 }`
-- `POST /api/rooms/{roomId}/score/add`
-  - Body: `{ "playerId": "...", "delta": 1 }`
-- `POST /api/rooms/{roomId}/playlist/load`
-  - Body: `{ "playlistId": "..." }`
-- `POST /api/rooms/{roomId}/playback/set`
-  - Body: `{ "trackIndex": 0, "paused": true, "positionMs": 0 }` (fields optional as appropriate)
-- `POST /api/rooms/{roomId}/playback/pause`
-  - Body: `{ "paused": true }`
-- `POST /api/rooms/{roomId}/playback/seek`
-  - Body: `{ "positionMs": 30000 }`
+- Add `gameId` to the room schema so multiple games can coexist cleanly.
+- Replace placeholder auth with real OIDC login/registration and token validation.
+- Implement actual YouTube playback for Name That Tune (player embed + drift correction).
 
-#### Player actions
-- `POST /api/rooms/{roomId}/buzz`
-  - Body: `{ "playerId": "..." }`
-
-#### Profile / account (auth required)
-- `GET    /api/me`
-- `PUT    /api/me`
-  - Body: `{ "nickname": "...", "pictureUrl": "..." }`
-- `DELETE /api/me`
-
-#### Playlists (auth required)
-- `GET  /api/me/playlists`
-- `POST /api/me/playlists`
-  - Body: `{ "name": "My Playlist" }`
-- `PATCH /api/me/playlists/{playlistId}`
-  - Body: `{ "name": "New Name" }`
-- `POST /api/me/playlists/{playlistId}/items`
-  - Body: `{ "title": "Song", "youtubeUrl": "https://www.youtube.com/watch?v=..." }`
-
-### WebSocket endpoint
-
-- `GET /api/rooms/{roomId}/ws`
-
-The server sends:
-- an initial event: `type = "room.snapshot"` with full room state
-- subsequent events when changes happen (including new snapshots after most mutations)
-
-Clients should treat snapshots as authoritative.
-
----
-
-## Notes / Next steps
-
-- Replace the placeholder auth flow with a real OIDC client in the frontend and proper token validation in the backend.
-- Add persistence (DB) for profiles/playlists/rooms if you want state across restarts.
-- Implement synchronized YouTube playback (embed player, leader controls, drift correction).
-- Add game rules: lock buzzer, timers, answer validation, etc.

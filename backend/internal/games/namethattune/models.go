@@ -1,23 +1,6 @@
-package game
+package namethattune
 
 import "time"
-
-// This file contains the domain models shared across layers (repo + HTTP API).
-// It exists because the previous in-memory store file also held the model types,
-// and that file has been removed while reworking persistence.
-
-// ============================
-// Profiles / Users
-// ============================
-
-// UserProfile represents the user-customizable profile attributes.
-// The stable identifier for an authenticated user is the OIDC "sub".
-type UserProfile struct {
-	Sub        string    `json:"sub"`
-	Nickname   string    `json:"nickname"`
-	PictureURL string    `json:"pictureUrl"`
-	UpdatedAt  time.Time `json:"updatedAt"`
-}
 
 // ============================
 // Playlists
@@ -85,23 +68,7 @@ type RoomSnapshot struct {
 	Playback PlaybackView  `json:"playback"`
 }
 
-// ============================
-// Errors (domain-level)
-// ============================
-
-var (
-	// Rooms / players
-	ErrRoomNotFound   = errorString("room not found")
-	ErrPlayerNotFound = errorString("player not found")
-	ErrNotOwner       = errorString("not room owner")
-
-	// Auth / input
-	ErrUnauthorized = errorString("unauthorized")
-	ErrInvalidInput = errorString("invalid input")
-
-	// Playlists
-	ErrPlaylistNotFound = errorString("playlist not found")
-)
+var ErrPlaylistNotFound = errorString("playlist not found")
 
 // errorString is a tiny internal error type to avoid importing "errors" here.
 // It behaves like errors.New(...) but keeps this file dependency-light.

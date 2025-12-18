@@ -1,4 +1,4 @@
-package game
+package namethattune
 
 import (
 	"fmt"
@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// extractYouTubeID parses a YouTube URL and extracts the video ID.
+// ExtractYouTubeID parses a YouTube URL and extracts the video ID.
 //
 // Supported forms:
 // - https://www.youtube.com/watch?v=<id>
@@ -18,15 +18,15 @@ import (
 //
 // It does not validate that the video exists; it only validates that the ID
 // matches a safe pattern.
-func extractYouTubeID(raw string) (string, error) {
+func ExtractYouTubeID(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return "", fmt.Errorf("%w: empty youtube url", ErrInvalidInput)
+		return "", fmt.Errorf("empty youtube url")
 	}
 
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		return "", fmt.Errorf("%w: invalid youtube url", ErrInvalidInput)
+		return "", fmt.Errorf("invalid youtube url")
 	}
 
 	host := strings.ToLower(u.Host)
@@ -40,7 +40,7 @@ func extractYouTubeID(raw string) (string, error) {
 		if isYouTubeID(id) {
 			return id, nil
 		}
-		return "", fmt.Errorf("%w: invalid youtube id", ErrInvalidInput)
+		return "", fmt.Errorf("invalid youtube id")
 	}
 
 	// youtube.com/*
@@ -51,7 +51,7 @@ func extractYouTubeID(raw string) (string, error) {
 			if isYouTubeID(id) {
 				return id, nil
 			}
-			return "", fmt.Errorf("%w: invalid youtube id", ErrInvalidInput)
+			return "", fmt.Errorf("invalid youtube id")
 		}
 
 		// /embed/<id>
@@ -61,7 +61,7 @@ func extractYouTubeID(raw string) (string, error) {
 			if isYouTubeID(id) {
 				return id, nil
 			}
-			return "", fmt.Errorf("%w: invalid youtube id", ErrInvalidInput)
+			return "", fmt.Errorf("invalid youtube id")
 		}
 
 		// /shorts/<id>
@@ -71,11 +71,11 @@ func extractYouTubeID(raw string) (string, error) {
 			if isYouTubeID(id) {
 				return id, nil
 			}
-			return "", fmt.Errorf("%w: invalid youtube id", ErrInvalidInput)
+			return "", fmt.Errorf("invalid youtube id")
 		}
 	}
 
-	return "", fmt.Errorf("%w: unsupported youtube url", ErrInvalidInput)
+	return "", fmt.Errorf("unsupported youtube url")
 }
 
 // isYouTubeID performs a conservative validation of a YouTube video ID.

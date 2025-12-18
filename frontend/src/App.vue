@@ -5,9 +5,9 @@ import { RouterView, RouterLink } from 'vue-router'
 <template>
   <div class="app">
     <header class="app-header">
-      <RouterLink class="brand" to="/">bes-blind</RouterLink>
+      <RouterLink class="brand" to="/">bes-games</RouterLink>
       <nav class="nav">
-        <RouterLink class="link" to="/">Home</RouterLink>
+        <RouterLink class="link" to="/">Games</RouterLink>
         <RouterLink class="link" to="/profile">Profile</RouterLink>
       </nav>
     </header>

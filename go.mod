@@ -1,4 +1,4 @@
-module github.com/valentin/bes-blind
+module github.com/valentin/bes-games
 
 go 1.25.4
 

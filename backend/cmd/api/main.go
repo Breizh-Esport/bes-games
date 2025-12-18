@@ -20,10 +20,11 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
 
-	"github.com/valentin/bes-blind/backend/internal/db"
-	"github.com/valentin/bes-blind/backend/internal/game"
-	"github.com/valentin/bes-blind/backend/internal/httpapi"
-	"github.com/valentin/bes-blind/backend/internal/realtime"
+	"github.com/valentin/bes-games/backend/internal/core"
+	"github.com/valentin/bes-games/backend/internal/db"
+	"github.com/valentin/bes-games/backend/internal/games/namethattune"
+	"github.com/valentin/bes-games/backend/internal/httpapi"
+	"github.com/valentin/bes-games/backend/internal/realtime"
 )
 
 const (
@@ -68,8 +69,9 @@ func main() {
 	rt := realtime.NewRegistry()
 
 	// --- Repo + API ---
-	repo := game.NewRepo(pool)
-	api := httpapi.NewServer(repo, rt)
+	coreRepo := core.NewRepo(pool)
+	nttRepo := namethattune.NewRepo(pool)
+	api := httpapi.NewServer(coreRepo, nttRepo, rt)
 
 	allowedOrigins := splitCommaEnv("BES_CORS_ALLOWED_ORIGINS")
 	handler := api.Handler(httpapi.Options{

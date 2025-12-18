@@ -12,9 +12,10 @@ import (
 	"github.com/coder/websocket"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/valentin/bes-blind/backend/internal/game"
-	"github.com/valentin/bes-blind/backend/internal/httpapi/testutil"
-	"github.com/valentin/bes-blind/backend/internal/realtime"
+	"github.com/valentin/bes-games/backend/internal/core"
+	"github.com/valentin/bes-games/backend/internal/games/namethattune"
+	"github.com/valentin/bes-games/backend/internal/httpapi/testutil"
+	"github.com/valentin/bes-games/backend/internal/realtime"
 )
 
 func TestHealthz(t *testing.T) {
@@ -40,6 +41,33 @@ func TestHealthz(t *testing.T) {
 	}
 }
 
+func TestGames_List(t *testing.T) {
+	t.Parallel()
+
+	srv := newTestServerNoDB(t)
+	h := srv.Handler(Options{AllowedOrigins: []string{"http://localhost:5173"}})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/games", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var body struct {
+		Games []struct {
+			ID string `json:"id"`
+		} `json:"games"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(body.Games) == 0 {
+		t.Fatalf("expected at least one game")
+	}
+}
+
 func TestRooms_CreateRoomRequiresAuth(t *testing.T) {
 	t.Parallel()
 
@@ -48,7 +76,7 @@ func TestRooms_CreateRoomRequiresAuth(t *testing.T) {
 	srv := newTestServer(t, pool)
 	h := srv.Handler(Options{AllowedOrigins: []string{"http://localhost:5173"}})
 
-	req := httptest.NewRequest(http.MethodPost, "/api/rooms", strings.NewReader(`{"name":"My Room"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/games/name-that-tune/rooms", strings.NewReader(`{"name":"My Room"}`))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -70,7 +98,7 @@ func TestRooms_CreateListJoinLeaveAndGetSnapshot(t *testing.T) {
 
 	// List rooms shows our room
 	{
-		req := httptest.NewRequest(http.MethodGet, "/api/rooms", nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/games/name-that-tune/rooms", nil)
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, req)
 
@@ -111,7 +139,7 @@ func TestRooms_CreateListJoinLeaveAndGetSnapshot(t *testing.T) {
 
 	// Get snapshot should show player online
 	{
-		req := httptest.NewRequest(http.MethodGet, "/api/rooms/"+roomID, nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/games/name-that-tune/rooms/"+roomID, nil)
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, req)
 
@@ -119,7 +147,7 @@ func TestRooms_CreateListJoinLeaveAndGetSnapshot(t *testing.T) {
 			t.Fatalf("get room: expected 200, got %d: %s", rr.Code, rr.Body.String())
 		}
 
-		var snap game.RoomSnapshot
+		var snap namethattune.RoomSnapshot
 		if err := json.Unmarshal(rr.Body.Bytes(), &snap); err != nil {
 			t.Fatalf("get room: unmarshal: %v", err)
 		}
@@ -142,7 +170,7 @@ func TestRooms_CreateListJoinLeaveAndGetSnapshot(t *testing.T) {
 
 	// Leave room marks player offline (still in roster)
 	{
-		req := httptest.NewRequest(http.MethodPost, "/api/rooms/"+roomID+"/leave", strings.NewReader(`{"playerId":"`+playerID+`"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/games/name-that-tune/rooms/"+roomID+"/leave", strings.NewReader(`{"playerId":"`+playerID+`"}`))
 		req.Header.Set("Content-Type", "application/json")
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, req)
@@ -151,11 +179,11 @@ func TestRooms_CreateListJoinLeaveAndGetSnapshot(t *testing.T) {
 			t.Fatalf("leave room: expected 200, got %d: %s", rr.Code, rr.Body.String())
 		}
 
-		req2 := httptest.NewRequest(http.MethodGet, "/api/rooms/"+roomID, nil)
+		req2 := httptest.NewRequest(http.MethodGet, "/api/games/name-that-tune/rooms/"+roomID, nil)
 		rr2 := httptest.NewRecorder()
 		h.ServeHTTP(rr2, req2)
 
-		var snap game.RoomSnapshot
+		var snap namethattune.RoomSnapshot
 		if err := json.Unmarshal(rr2.Body.Bytes(), &snap); err != nil {
 			t.Fatalf("after leave: unmarshal: %v", err)
 		}
@@ -172,7 +200,7 @@ func TestRooms_CreateListJoinLeaveAndGetSnapshot(t *testing.T) {
 
 	// List rooms should now show 0 online
 	{
-		req := httptest.NewRequest(http.MethodGet, "/api/rooms", nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/games/name-that-tune/rooms", nil)
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, req)
 
@@ -209,7 +237,7 @@ func TestOwnerControls_ForbiddenForNonOwner(t *testing.T) {
 	roomID := createRoom(t, h, "owner-sub", "Room")
 	playerID := joinRoom(t, h, roomID, "", `{"nickname":"P1"}`)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/rooms/"+roomID+"/kick", strings.NewReader(`{"playerId":"`+playerID+`"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/games/name-that-tune/rooms/"+roomID+"/kick", strings.NewReader(`{"playerId":"`+playerID+`"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-User-Sub", "someone-else")
 	rr := httptest.NewRecorder()
@@ -233,7 +261,7 @@ func TestOwnerControls_ScoreAndKick(t *testing.T) {
 
 	// Add score +2
 	{
-		req := httptest.NewRequest(http.MethodPost, "/api/rooms/"+roomID+"/score/add", strings.NewReader(`{"playerId":"`+playerID+`","delta":2}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/games/name-that-tune/rooms/"+roomID+"/score/add", strings.NewReader(`{"playerId":"`+playerID+`","delta":2}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-User-Sub", "owner-sub")
 		rr := httptest.NewRecorder()
@@ -243,7 +271,7 @@ func TestOwnerControls_ScoreAndKick(t *testing.T) {
 			t.Fatalf("score add: expected 200, got %d: %s", rr.Code, rr.Body.String())
 		}
 
-		var snap game.RoomSnapshot
+		var snap namethattune.RoomSnapshot
 		if err := json.Unmarshal(rr.Body.Bytes(), &snap); err != nil {
 			t.Fatalf("score add: unmarshal: %v", err)
 		}
@@ -255,7 +283,7 @@ func TestOwnerControls_ScoreAndKick(t *testing.T) {
 
 	// Set score to 7
 	{
-		req := httptest.NewRequest(http.MethodPost, "/api/rooms/"+roomID+"/score/set", strings.NewReader(`{"playerId":"`+playerID+`","score":7}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/games/name-that-tune/rooms/"+roomID+"/score/set", strings.NewReader(`{"playerId":"`+playerID+`","score":7}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-User-Sub", "owner-sub")
 		rr := httptest.NewRecorder()
@@ -265,7 +293,7 @@ func TestOwnerControls_ScoreAndKick(t *testing.T) {
 			t.Fatalf("score set: expected 200, got %d: %s", rr.Code, rr.Body.String())
 		}
 
-		var snap game.RoomSnapshot
+		var snap namethattune.RoomSnapshot
 		if err := json.Unmarshal(rr.Body.Bytes(), &snap); err != nil {
 			t.Fatalf("score set: unmarshal: %v", err)
 		}
@@ -277,7 +305,7 @@ func TestOwnerControls_ScoreAndKick(t *testing.T) {
 
 	// Kick player
 	{
-		req := httptest.NewRequest(http.MethodPost, "/api/rooms/"+roomID+"/kick", strings.NewReader(`{"playerId":"`+playerID+`"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/games/name-that-tune/rooms/"+roomID+"/kick", strings.NewReader(`{"playerId":"`+playerID+`"}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-User-Sub", "owner-sub")
 		rr := httptest.NewRecorder()
@@ -287,7 +315,7 @@ func TestOwnerControls_ScoreAndKick(t *testing.T) {
 			t.Fatalf("kick: expected 200, got %d: %s", rr.Code, rr.Body.String())
 		}
 
-		var snap game.RoomSnapshot
+		var snap namethattune.RoomSnapshot
 		if err := json.Unmarshal(rr.Body.Bytes(), &snap); err != nil {
 			t.Fatalf("kick: unmarshal: %v", err)
 		}
@@ -320,10 +348,10 @@ func TestProfileAndPlaylists_CRUDAndRoomLoad(t *testing.T) {
 		}
 	}
 
-	// POST /api/me/playlists
+	// POST /api/games/name-that-tune/playlists
 	var playlistID string
 	{
-		req := httptest.NewRequest(http.MethodPost, "/api/me/playlists", strings.NewReader(`{"name":"Hits"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/games/name-that-tune/playlists", strings.NewReader(`{"name":"Hits"}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-User-Sub", ownerSub)
 		rr := httptest.NewRecorder()
@@ -333,7 +361,7 @@ func TestProfileAndPlaylists_CRUDAndRoomLoad(t *testing.T) {
 			t.Fatalf("create playlist: expected 201, got %d: %s", rr.Code, rr.Body.String())
 		}
 
-		var pl game.Playlist
+		var pl namethattune.Playlist
 		if err := json.Unmarshal(rr.Body.Bytes(), &pl); err != nil {
 			t.Fatalf("create playlist: unmarshal: %v", err)
 		}
@@ -348,7 +376,7 @@ func TestProfileAndPlaylists_CRUDAndRoomLoad(t *testing.T) {
 
 	// POST item
 	{
-		req := httptest.NewRequest(http.MethodPost, "/api/me/playlists/"+playlistID+"/items", strings.NewReader(`{"title":"Song","youtubeUrl":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/games/name-that-tune/playlists/"+playlistID+"/items", strings.NewReader(`{"title":"Song","youtubeUrl":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-User-Sub", ownerSub)
 		rr := httptest.NewRecorder()
@@ -361,7 +389,7 @@ func TestProfileAndPlaylists_CRUDAndRoomLoad(t *testing.T) {
 
 	// PATCH rename
 	{
-		req := httptest.NewRequest(http.MethodPatch, "/api/me/playlists/"+playlistID, strings.NewReader(`{"name":"Renamed"}`))
+		req := httptest.NewRequest(http.MethodPatch, "/api/games/name-that-tune/playlists/"+playlistID, strings.NewReader(`{"name":"Renamed"}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-User-Sub", ownerSub)
 		rr := httptest.NewRecorder()
@@ -371,7 +399,7 @@ func TestProfileAndPlaylists_CRUDAndRoomLoad(t *testing.T) {
 			t.Fatalf("rename playlist: expected 200, got %d: %s", rr.Code, rr.Body.String())
 		}
 
-		var pl game.Playlist
+		var pl namethattune.Playlist
 		if err := json.Unmarshal(rr.Body.Bytes(), &pl); err != nil {
 			t.Fatalf("rename playlist: unmarshal: %v", err)
 		}
@@ -385,7 +413,7 @@ func TestProfileAndPlaylists_CRUDAndRoomLoad(t *testing.T) {
 
 	// GET playlists should include items (server currently loads full playlist per list entry)
 	{
-		req := httptest.NewRequest(http.MethodGet, "/api/me/playlists", nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/games/name-that-tune/playlists", nil)
 		req.Header.Set("X-User-Sub", ownerSub)
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, req)
@@ -395,7 +423,7 @@ func TestProfileAndPlaylists_CRUDAndRoomLoad(t *testing.T) {
 		}
 
 		var res struct {
-			Playlists []game.Playlist `json:"playlists"`
+			Playlists []namethattune.Playlist `json:"playlists"`
 		}
 		if err := json.Unmarshal(rr.Body.Bytes(), &res); err != nil {
 			t.Fatalf("list playlists: unmarshal: %v", err)
@@ -414,7 +442,7 @@ func TestProfileAndPlaylists_CRUDAndRoomLoad(t *testing.T) {
 	// Create room and load playlist into room
 	roomID := createRoom(t, h, ownerSub, "Room")
 	{
-		req := httptest.NewRequest(http.MethodPost, "/api/rooms/"+roomID+"/playlist/load", strings.NewReader(`{"playlistId":"`+playlistID+`"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/games/name-that-tune/rooms/"+roomID+"/playlist/load", strings.NewReader(`{"playlistId":"`+playlistID+`"}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-User-Sub", ownerSub)
 		rr := httptest.NewRecorder()
@@ -424,7 +452,7 @@ func TestProfileAndPlaylists_CRUDAndRoomLoad(t *testing.T) {
 			t.Fatalf("load playlist: expected 200, got %d: %s", rr.Code, rr.Body.String())
 		}
 
-		var snap game.RoomSnapshot
+		var snap namethattune.RoomSnapshot
 		if err := json.Unmarshal(rr.Body.Bytes(), &snap); err != nil {
 			t.Fatalf("load playlist: unmarshal: %v", err)
 		}
@@ -455,7 +483,7 @@ func TestRoomWebSocket_ReceivesInitialSnapshot(t *testing.T) {
 
 	roomID := createRoom(t, h, "owner-sub", "WS Room")
 
-	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/api/rooms/" + roomID + "/ws"
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/api/games/name-that-tune/rooms/" + roomID + "/ws"
 
 	dialCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -487,7 +515,7 @@ func TestRoomWebSocket_ReceivesInitialSnapshot(t *testing.T) {
 		t.Fatalf("expected event roomId %q, got %q", roomID, ev.RoomID)
 	}
 
-	var snap game.RoomSnapshot
+	var snap namethattune.RoomSnapshot
 	if err := json.Unmarshal(ev.Payload, &snap); err != nil {
 		t.Fatalf("ws snapshot payload unmarshal: %v", err)
 	}
@@ -505,14 +533,15 @@ func newTestServerNoDB(t *testing.T) *Server {
 
 	// For routes that don't require DB (like /healthz), we can run a server with nil deps.
 	// Handlers that touch DB will panic; tests must not call them here.
-	return NewServer(nil, realtime.NewRegistry())
+	return NewServer(nil, nil, realtime.NewRegistry())
 }
 
 func newTestServer(t *testing.T, pool *pgxpool.Pool) *Server {
 	t.Helper()
-	repo := game.NewRepo(pool)
+	coreRepo := core.NewRepo(pool)
+	nttRepo := namethattune.NewRepo(pool)
 	rt := realtime.NewRegistry()
-	return NewServer(repo, rt)
+	return NewServer(coreRepo, nttRepo, rt)
 }
 
 func freshDB(t *testing.T, ctx context.Context) *pgxpool.Pool {
@@ -532,7 +561,7 @@ func freshDB(t *testing.T, ctx context.Context) *pgxpool.Pool {
 func createRoom(t *testing.T, h http.Handler, ownerSub, name string) string {
 	t.Helper()
 
-	req := httptest.NewRequest(http.MethodPost, "/api/rooms", strings.NewReader(`{"name":"`+jsonEscape(name)+`"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/games/name-that-tune/rooms", strings.NewReader(`{"name":"`+jsonEscape(name)+`"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-User-Sub", ownerSub)
 
@@ -558,7 +587,7 @@ func createRoom(t *testing.T, h http.Handler, ownerSub, name string) string {
 func joinRoom(t *testing.T, h http.Handler, roomID, sub, body string) string {
 	t.Helper()
 
-	req := httptest.NewRequest(http.MethodPost, "/api/rooms/"+roomID+"/join", strings.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/games/name-that-tune/rooms/"+roomID+"/join", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	if sub != "" {
 		req.Header.Set("X-User-Sub", sub)
@@ -582,7 +611,7 @@ func joinRoom(t *testing.T, h http.Handler, roomID, sub, body string) string {
 	return res.PlayerID
 }
 
-func findPlayer(t *testing.T, snap game.RoomSnapshot, playerID string) game.PlayerView {
+func findPlayer(t *testing.T, snap namethattune.RoomSnapshot, playerID string) namethattune.PlayerView {
 	t.Helper()
 
 	for _, p := range snap.Players {
@@ -591,7 +620,7 @@ func findPlayer(t *testing.T, snap game.RoomSnapshot, playerID string) game.Play
 		}
 	}
 	t.Fatalf("player %q not found in snapshot", playerID)
-	return game.PlayerView{}
+	return namethattune.PlayerView{}
 }
 
 func jsonEscape(s string) string {

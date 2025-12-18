@@ -1,5 +1,5 @@
 -- +goose Up
--- Initial schema for bes-blind (Name That Tune)
+-- Initial schema for bes-games (initial game: Name That Tune)
 --
 -- Notes:
 -- - We use OIDC subject ("sub") as the stable user identifier.

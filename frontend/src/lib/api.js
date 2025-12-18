@@ -1,4 +1,4 @@
-// Minimal API client for the bes-blind backend.
+// Minimal API client for the bes-games backend.
 //
 // Auth model (temporary):
 // - The backend expects an authenticated user subject in header `X-User-Sub`
@@ -7,101 +7,115 @@
 // Anonymous users can still call endpoints that do not require auth.
 //
 // You can change the base URL with:
-//   - VITE_API_BASE_URL (e.g. "http://localhost:8080")
-// Default is "http://localhost:8080"
+//   - VITE_API_BASE_URL (e.g. 'http://localhost:8080')
+// Default is 'http://localhost:8080'
 
-const DEFAULT_BASE_URL = 'http://localhost:8080'
-const LS_USER_SUB_KEY = 'besblind.userSub'
+const DEFAULT_BASE_URL = "http://localhost:8080";
+const LS_USER_SUB_KEY = "besgames.userSub";
 
 export function getApiBaseUrl() {
-  return (import.meta?.env?.VITE_API_BASE_URL || DEFAULT_BASE_URL).replace(/\/+$/, '')
+  return (import.meta?.env?.VITE_API_BASE_URL || DEFAULT_BASE_URL).replace(
+    /\/+$/,
+    "",
+  );
 }
 
 export function getUserSub() {
   try {
-    return (localStorage.getItem(LS_USER_SUB_KEY) || '').trim()
+    return (localStorage.getItem(LS_USER_SUB_KEY) || "").trim();
   } catch {
-    return ''
+    return "";
   }
 }
 
 export function setUserSub(sub) {
-  const v = (sub || '').trim()
+  const v = (sub || "").trim();
   try {
-    if (!v) localStorage.removeItem(LS_USER_SUB_KEY)
-    else localStorage.setItem(LS_USER_SUB_KEY, v)
+    if (!v) localStorage.removeItem(LS_USER_SUB_KEY);
+    else localStorage.setItem(LS_USER_SUB_KEY, v);
   } catch {
     // ignore
   }
-  return v
+  return v;
 }
 
 export function clearUserSub() {
-  return setUserSub('')
+  return setUserSub("");
 }
 
 export class ApiError extends Error {
-  constructor(message, { status = 0, payload = null, url = '', method = '' } = {}) {
-    super(message)
-    this.name = 'ApiError'
-    this.status = status
-    this.payload = payload
-    this.url = url
-    this.method = method
+  constructor(
+    message,
+    { status = 0, payload = null, url = "", method = "" } = {},
+  ) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.payload = payload;
+    this.url = url;
+    this.method = method;
   }
 }
 
 function buildHeaders({ auth = false, extraHeaders = {} } = {}) {
   const headers = {
-    Accept: 'application/json',
+    Accept: "application/json",
     ...extraHeaders,
-  }
+  };
 
   if (auth) {
-    const sub = getUserSub()
-    if (sub) headers['X-User-Sub'] = sub
+    const sub = getUserSub();
+    if (sub) headers["X-User-Sub"] = sub;
   }
 
-  return headers
+  return headers;
 }
 
 async function parseJsonSafely(res) {
-  const ct = (res.headers.get('content-type') || '').toLowerCase()
-  if (!ct.includes('application/json')) return null
+  const ct = (res.headers.get("content-type") || "").toLowerCase();
+  if (!ct.includes("application/json")) return null;
   try {
-    return await res.json()
+    return await res.json();
   } catch {
-    return null
+    return null;
   }
 }
 
-async function request(path, { method = 'GET', auth = false, body, headers = {}, signal } = {}) {
-  const base = getApiBaseUrl()
-  const url = `${base}${path.startsWith('/') ? '' : '/'}${path}`
+async function request(
+  path,
+  { method = "GET", auth = false, body, headers = {}, signal } = {},
+) {
+  const base = getApiBaseUrl();
+  const url = `${base}${path.startsWith("/") ? "" : "/"}${path}`;
 
   const init = {
     method,
     headers: buildHeaders({ auth, extraHeaders: headers }),
     signal,
-  }
+  };
 
   if (body !== undefined) {
-    init.headers['Content-Type'] = 'application/json'
-    init.body = JSON.stringify(body)
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(body);
   }
 
-  const res = await fetch(url, init)
-  const payload = await parseJsonSafely(res)
+  const res = await fetch(url, init);
+  const payload = await parseJsonSafely(res);
 
   if (!res.ok) {
     const msg =
       (payload && (payload.error || payload.message)) ||
-      `${method} ${path} failed with status ${res.status}`
-    throw new ApiError(msg, { status: res.status, payload, url, method })
+      `${method} ${path} failed with status ${res.status}`;
+    throw new ApiError(msg, { status: res.status, payload, url, method });
   }
 
-  // Prefer JSON payload; if none, return null.
-  return payload
+  return payload;
+}
+
+function gamePrefix(gameId) {
+  const id = (gameId || "").trim();
+  if (!id) throw new Error("gameId is required");
+  return `/api/games/${encodeURIComponent(id)}`;
 }
 
 // --------------------
@@ -109,151 +123,207 @@ async function request(path, { method = 'GET', auth = false, body, headers = {},
 // --------------------
 
 export const api = {
-  // Rooms
-  listRooms() {
-    return request('/api/rooms')
+  // Games
+  listGames() {
+    return request("/api/games");
   },
 
-  createRoom({ name }) {
-    return request('/api/rooms', { method: 'POST', auth: true, body: { name } })
+  // Rooms (per-game)
+  listRooms(gameId) {
+    return request(`${gamePrefix(gameId)}/rooms`);
   },
 
-  getRoom(roomId) {
-    return request(`/api/rooms/${encodeURIComponent(roomId)}`)
+  createRoom(gameId, { name }) {
+    return request(`${gamePrefix(gameId)}/rooms`, {
+      method: "POST",
+      auth: true,
+      body: { name },
+    });
   },
 
-  joinRoom(roomId, { nickname, pictureUrl } = {}) {
-    return request(`/api/rooms/${encodeURIComponent(roomId)}/join`, {
-      method: 'POST',
-      auth: false, // anonymous allowed
-      body: { nickname, pictureUrl },
-    })
+  getRoom(gameId, roomId) {
+    return request(`${gamePrefix(gameId)}/rooms/${encodeURIComponent(roomId)}`);
   },
 
-  leaveRoom(roomId, { playerId }) {
-    return request(`/api/rooms/${encodeURIComponent(roomId)}/leave`, {
-      method: 'POST',
-      auth: false,
-      body: { playerId },
-    })
+  joinRoom(gameId, roomId, { nickname, pictureUrl } = {}) {
+    return request(
+      `${gamePrefix(gameId)}/rooms/${encodeURIComponent(roomId)}/join`,
+      {
+        method: "POST",
+        auth: false, // anonymous allowed
+        body: { nickname, pictureUrl },
+      },
+    );
+  },
+
+  leaveRoom(gameId, roomId, { playerId }) {
+    return request(
+      `${gamePrefix(gameId)}/rooms/${encodeURIComponent(roomId)}/leave`,
+      {
+        method: "POST",
+        auth: false,
+        body: { playerId },
+      },
+    );
   },
 
   // Owner controls
-  kick(roomId, { playerId }) {
-    return request(`/api/rooms/${encodeURIComponent(roomId)}/kick`, {
-      method: 'POST',
-      auth: true,
-      body: { playerId },
-    })
+  kick(gameId, roomId, { playerId }) {
+    return request(
+      `${gamePrefix(gameId)}/rooms/${encodeURIComponent(roomId)}/kick`,
+      {
+        method: "POST",
+        auth: true,
+        body: { playerId },
+      },
+    );
   },
 
-  setScore(roomId, { playerId, score }) {
-    return request(`/api/rooms/${encodeURIComponent(roomId)}/score/set`, {
-      method: 'POST',
-      auth: true,
-      body: { playerId, score },
-    })
+  setScore(gameId, roomId, { playerId, score }) {
+    return request(
+      `${gamePrefix(gameId)}/rooms/${encodeURIComponent(roomId)}/score/set`,
+      {
+        method: "POST",
+        auth: true,
+        body: { playerId, score },
+      },
+    );
   },
 
-  addScore(roomId, { playerId, delta }) {
-    return request(`/api/rooms/${encodeURIComponent(roomId)}/score/add`, {
-      method: 'POST',
-      auth: true,
-      body: { playerId, delta },
-    })
+  addScore(gameId, roomId, { playerId, delta }) {
+    return request(
+      `${gamePrefix(gameId)}/rooms/${encodeURIComponent(roomId)}/score/add`,
+      {
+        method: "POST",
+        auth: true,
+        body: { playerId, delta },
+      },
+    );
   },
 
-  loadPlaylist(roomId, { playlistId }) {
-    return request(`/api/rooms/${encodeURIComponent(roomId)}/playlist/load`, {
-      method: 'POST',
-      auth: true,
-      body: { playlistId },
-    })
+  loadPlaylist(gameId, roomId, { playlistId }) {
+    return request(
+      `${gamePrefix(gameId)}/rooms/${encodeURIComponent(roomId)}/playlist/load`,
+      {
+        method: "POST",
+        auth: true,
+        body: { playlistId },
+      },
+    );
   },
 
-  setPlayback(roomId, { trackIndex, paused, positionMs } = {}) {
-    return request(`/api/rooms/${encodeURIComponent(roomId)}/playback/set`, {
-      method: 'POST',
-      auth: true,
-      body: { trackIndex, paused, positionMs },
-    })
+  setPlayback(gameId, roomId, { trackIndex, paused, positionMs } = {}) {
+    return request(
+      `${gamePrefix(gameId)}/rooms/${encodeURIComponent(roomId)}/playback/set`,
+      {
+        method: "POST",
+        auth: true,
+        body: { trackIndex, paused, positionMs },
+      },
+    );
   },
 
-  pause(roomId, { paused }) {
-    return request(`/api/rooms/${encodeURIComponent(roomId)}/playback/pause`, {
-      method: 'POST',
-      auth: true,
-      body: { paused },
-    })
+  pause(gameId, roomId, { paused }) {
+    return request(
+      `${gamePrefix(gameId)}/rooms/${encodeURIComponent(roomId)}/playback/pause`,
+      {
+        method: "POST",
+        auth: true,
+        body: { paused },
+      },
+    );
   },
 
-  seek(roomId, { positionMs }) {
-    return request(`/api/rooms/${encodeURIComponent(roomId)}/playback/seek`, {
-      method: 'POST',
-      auth: true,
-      body: { positionMs },
-    })
+  seek(gameId, roomId, { positionMs }) {
+    return request(
+      `${gamePrefix(gameId)}/rooms/${encodeURIComponent(roomId)}/playback/seek`,
+      {
+        method: "POST",
+        auth: true,
+        body: { positionMs },
+      },
+    );
   },
 
   // Player actions
-  buzz(roomId, { playerId }) {
-    return request(`/api/rooms/${encodeURIComponent(roomId)}/buzz`, {
-      method: 'POST',
-      auth: false,
-      body: { playerId },
-    })
+  buzz(gameId, roomId, { playerId }) {
+    return request(
+      `${gamePrefix(gameId)}/rooms/${encodeURIComponent(roomId)}/buzz`,
+      {
+        method: "POST",
+        auth: false,
+        body: { playerId },
+      },
+    );
   },
 
   // Profile / account
   getMe() {
-    return request('/api/me', { auth: true })
+    return request("/api/me", { auth: true });
   },
 
   putMe({ nickname, pictureUrl }) {
-    return request('/api/me', { method: 'PUT', auth: true, body: { nickname, pictureUrl } })
+    return request("/api/me", {
+      method: "PUT",
+      auth: true,
+      body: { nickname, pictureUrl },
+    });
   },
 
   deleteMe() {
-    return request('/api/me', { method: 'DELETE', auth: true })
+    return request("/api/me", { method: "DELETE", auth: true });
   },
 
-  // Playlists
-  listMyPlaylists() {
-    return request('/api/me/playlists', { auth: true })
+  // Playlists (per-game, owned by authenticated user)
+  listPlaylists(gameId) {
+    return request(`${gamePrefix(gameId)}/playlists`, { auth: true });
   },
 
-  createMyPlaylist({ name }) {
-    return request('/api/me/playlists', { method: 'POST', auth: true, body: { name } })
-  },
-
-  patchMyPlaylist(playlistId, { name }) {
-    return request(`/api/me/playlists/${encodeURIComponent(playlistId)}`, {
-      method: 'PATCH',
+  createPlaylist(gameId, { name }) {
+    return request(`${gamePrefix(gameId)}/playlists`, {
+      method: "POST",
       auth: true,
       body: { name },
-    })
+    });
   },
 
-  addMyPlaylistItem(playlistId, { title, youtubeUrl }) {
-    return request(`/api/me/playlists/${encodeURIComponent(playlistId)}/items`, {
-      method: 'POST',
-      auth: true,
-      body: { title, youtubeUrl },
-    })
+  patchPlaylist(gameId, playlistId, { name }) {
+    return request(
+      `${gamePrefix(gameId)}/playlists/${encodeURIComponent(playlistId)}`,
+      {
+        method: "PATCH",
+        auth: true,
+        body: { name },
+      },
+    );
   },
-}
+
+  addPlaylistItem(gameId, playlistId, { title, youtubeUrl }) {
+    return request(
+      `${gamePrefix(gameId)}/playlists/${encodeURIComponent(playlistId)}/items`,
+      {
+        method: "POST",
+        auth: true,
+        body: { title, youtubeUrl },
+      },
+    );
+  },
+};
 
 // --------------------
 // WebSocket helper
 // --------------------
 //
-// Backend WS endpoint: GET /api/rooms/:roomId/ws
+// Backend WS endpoint: GET /api/games/:gameId/rooms/:roomId/ws
 // Sends `room.snapshot` first, then incremental events.
 //
 // Note: Browser WebSocket cannot set custom headers reliably (no X-User-Sub),
 // which is fine for read-only room events.
-export function roomWebSocketUrl(roomId) {
-  const base = getApiBaseUrl()
-  const wsBase = base.replace(/^http:\/\//, 'ws://').replace(/^https:\/\//, 'wss://')
-  return `${wsBase}/api/rooms/${encodeURIComponent(roomId)}/ws`
+export function roomWebSocketUrl(gameId, roomId) {
+  const base = getApiBaseUrl();
+  const wsBase = base
+    .replace(/^http:\/\//, "ws://")
+    .replace(/^https:\/\//, "wss://");
+  const prefix = gamePrefix(gameId);
+  return `${wsBase}${prefix}/rooms/${encodeURIComponent(roomId)}/ws`;
 }
