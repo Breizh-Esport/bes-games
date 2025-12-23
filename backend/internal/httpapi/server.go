@@ -69,6 +69,7 @@ type Server struct {
 	coreRepo *core.Repo
 	nttRepo  *namethattune.Repo
 	rt       *realtime.Registry
+	rooms    *roomLifecycle
 }
 
 type wsOriginPatternsCtxKey struct{}
@@ -89,7 +90,12 @@ type Options struct {
 }
 
 func NewServer(coreRepo *core.Repo, nttRepo *namethattune.Repo, rt *realtime.Registry) *Server {
-	return &Server{coreRepo: coreRepo, nttRepo: nttRepo, rt: rt}
+	return &Server{
+		coreRepo: coreRepo,
+		nttRepo:  nttRepo,
+		rt:       rt,
+		rooms:    newRoomLifecycle(nttRepo, rt),
+	}
 }
 
 func (s *Server) Handler(opts Options) http.Handler {
@@ -352,7 +358,7 @@ func (s *Server) handleJoinRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	playerID, err := s.nttRepo.JoinRoom(r.Context(), roomID, userSub(r), strings.TrimSpace(body.Nickname), strings.TrimSpace(body.PictureURL))
+	joinRes, err := s.nttRepo.JoinRoom(r.Context(), roomID, userSub(r), strings.TrimSpace(body.Nickname), strings.TrimSpace(body.PictureURL))
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -366,11 +372,20 @@ func (s *Server) handleJoinRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Owner came back online: cancel pending shutdown.
+	if joinRes.IsOwner {
+		s.rooms.cancelOwnerTimeout(roomID)
+	}
+
 	// Broadcast snapshot for all listeners.
 	s.broadcastSnapshot(r.Context(), roomID)
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"playerId": playerID,
+		"playerId": joinRes.PlayerID,
+		"owner": map[string]any{
+			"playerId": joinRes.OwnerPlayerID,
+			"online":   joinRes.OwnerConnected,
+		},
 		"snapshot": snap,
 	})
 }
@@ -387,9 +402,26 @@ func (s *Server) handleLeaveRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.nttRepo.LeaveRoom(r.Context(), roomID, strings.TrimSpace(body.PlayerID)); err != nil {
+	leaveRes, err := s.nttRepo.LeaveRoom(r.Context(), roomID, strings.TrimSpace(body.PlayerID))
+	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
+		return
+	}
+
+	closedReason := ""
+	if leaveRes.OwnerLeft && leaveRes.ConnectedAfter == 0 {
+		_ = s.rooms.closeRoom(r.Context(), roomID, reasonOwnerLeftEmpty)
+		closedReason = string(reasonOwnerLeftEmpty)
+	} else if !leaveRes.OwnerConnected && leaveRes.ConnectedAfter == 0 {
+		_ = s.rooms.closeRoom(r.Context(), roomID, reasonOwnerLeftEmpty)
+		closedReason = string(reasonOwnerLeftEmpty)
+	} else if leaveRes.OwnerLeft {
+		s.rooms.scheduleOwnerTimeout(roomID, 10*time.Minute)
+	}
+
+	if closedReason != "" {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "closed": true, "reason": closedReason})
 		return
 	}
 

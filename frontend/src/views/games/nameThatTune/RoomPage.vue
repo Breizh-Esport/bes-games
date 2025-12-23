@@ -133,7 +133,10 @@
                         </div>
                     </div>
 
-                    <div class="player-actions" v-if="isOwner">
+                    <div
+                        class="player-actions"
+                        v-if="isOwner && p.sub !== snapshot.ownerSub"
+                    >
                         <button
                             class="btn btn-ghost"
                             @click="scoreDelta(p.playerId, -1)"
@@ -167,21 +170,47 @@
             </div>
         </section>
 
+
         <section class="card">
             <div class="row row-space">
                 <div>
                     <h2 class="h2">Playback</h2>
                     <p class="muted">
-                        Owner loads a playlist and controls track/seek/play.
-                        Players can control volume locally.
+                        Owner loads a playlist and controls playback. Players cannot see track details.
                     </p>
                 </div>
             </div>
 
-            <div v-if="!snapshot" class="muted">LoadingÔÇª</div>
+            <div v-if="!snapshot" class="muted">Loading...</div>
 
             <template v-else>
                 <div class="row">
+                    <div class="col">
+                        <div class="muted small">Audio</div>
+                        <div class="strong">{{ volume }}%</div>
+                    </div>
+
+                    <div class="col">
+                        <label class="label" for="volume">Volume</label>
+                        <input
+                            id="volume"
+                            class="input"
+                            type="range"
+                            min="0"
+                            max="100"
+                            v-model.number="volume"
+                        />
+                    </div>
+
+                    <div class="col" v-if="isOwner">
+                        <div class="muted small">Role</div>
+                        <div class="strong">Owner</div>
+                    </div>
+                </div>
+
+                <div class="divider"></div>
+
+                <div class="row" v-if="isOwner">
                     <div class="col">
                         <div class="muted small">Loaded playlist</div>
                         <div class="strong">
@@ -212,7 +241,7 @@
                                 snapshot.playback?.paused ? "Paused" : "Playing"
                             }}
                             <span class="muted small"
-                                >ÔÇó pos
+                                - pos
                                 {{
                                     Math.floor(
                                         (snapshot.playback?.positionMs || 0) /
@@ -223,12 +252,15 @@
                         </div>
                     </div>
                 </div>
+                <div v-else class="muted">
+                    Playback details are hidden for players until the owner is present.
+                </div>
 
                 <div class="divider"></div>
 
                 <div class="grid">
                     <div class="card-inner" v-if="isOwner">
-                        <h3 class="h3">Owner controls</h3>
+                        <h3 class="h3">Controls</h3>
 
                         <p v-if="ownerError" class="error">{{ ownerError }}</p>
 
@@ -242,7 +274,7 @@
                                     class="input"
                                     v-model="selectedPlaylistId"
                                 >
-                                    <option value="">SelectÔÇª</option>
+                                    <option value="">Select...</option>
                                     <option
                                         v-for="pl in myPlaylists"
                                         :key="pl.id"
@@ -344,31 +376,11 @@
                         </div>
                     </div>
 
-                    <div class="card-inner">
+                    <div class="card-inner" v-if="!isOwner">
                         <h3 class="h3">Player controls</h3>
                         <p v-if="playerError" class="error">
                             {{ playerError }}
                         </p>
-
-                        <div class="row">
-                            <div class="col">
-                                <label class="label" for="volume">Volume</label>
-                                <input
-                                    id="volume"
-                                    class="input"
-                                    type="range"
-                                    min="0"
-                                    max="100"
-                                    v-model.number="volume"
-                                />
-                            </div>
-                            <div class="col">
-                                <div class="muted small">Current</div>
-                                <div class="strong">{{ volume }}%</div>
-                            </div>
-                        </div>
-
-                        <div class="divider"></div>
 
                         <div class="row">
                             <div class="col">
@@ -379,9 +391,9 @@
                                 <button
                                     class="btn btn-buzz"
                                     @click="buzz"
-                                    :disabled="!playerId || buzzing"
+                                    :disabled="!currentPlayerConnected || buzzing || roomClosedReason"
                                 >
-                                    {{ buzzing ? "BuzzingÔÇª" : "BUZZ" }}
+                                    {{ buzzing ? "Buzzing..." : "BUZZ" }}
                                 </button>
                             </div>
                         </div>
@@ -395,85 +407,64 @@
                                     "unknown"
                                 }}</strong>
                                 <span class="muted small"
-                                    >ÔÇó {{ formatRelative(lastBuzz.ts) }}</span
+                                    >? {{ formatRelative(lastBuzz.ts) }}</span
                                 >
                             </div>
                         </div>
 
                         <div class="hint muted small">
-                            Tip: Joining is currently done from Home. The room
-                            remembers your
-                            <code class="code">playerId</code> only in-memory on
-                            this page.
+                            Stay connected; if you disconnect you will be prompted to rejoin.
                         </div>
                     </div>
                 </div>
             </template>
         </section>
 
-        <section class="card">
-            <h2 class="h2">Join status</h2>
-            <p class="muted">
-                This page expects you already joined from Home. If you didnÔÇÖt,
-                you can join here quickly.
-            </p>
-
-            <div class="row">
-                <div class="col">
-                    <label class="label" for="quickNick"
-                        >Nickname (optional)</label
-                    >
-                    <input
-                        id="quickNick"
-                        v-model="quickNick"
-                        class="input"
-                        type="text"
-                        placeholder="Anonymous"
-                    />
-                </div>
-                <div class="col">
-                    <label class="label" for="quickPic"
-                        >Picture URL (optional)</label
-                    >
-                    <input
-                        id="quickPic"
-                        v-model="quickPic"
-                        class="input"
-                        type="url"
-                        placeholder="https://ÔÇª"
-                    />
-                </div>
-                <div class="actions">
-                    <button
-                        class="btn"
-                        @click="quickJoin"
-                        :disabled="joining || !roomId"
-                    >
-                        {{
-                            joining
-                                ? "JoiningÔÇª"
-                                : playerId
-                                  ? "Re-join (new playerId)"
-                                  : "Join"
-                        }}
-                    </button>
-                    <button
-                        class="btn btn-ghost"
-                        @click="leave"
-                        :disabled="leaving || !playerId"
-                    >
-                        Leave
-                    </button>
-                </div>
+        <div v-if="showJoinModal" class="modal-backdrop">
+            <div class="modal-card">
+                <h3 class="h3">
+                    {{ roomClosedReason ? "Room closed" : "Reconnect to play" }}
+                </h3>
+                <p class="muted" v-if="roomClosedReason">
+                    {{ closeReasonMessage }}
+                </p>
+                <template v-else>
+                    <p class="muted">
+                        Enter a nickname and picture to join this room.
+                    </p>
+                    <div class="row">
+                        <div class="col">
+                            <label class="label" for="modalNick">Nickname</label>
+                            <input
+                                id="modalNick"
+                                v-model="joinNick"
+                                class="input"
+                                type="text"
+                                placeholder="Anonymous"
+                            />
+                        </div>
+                        <div class="col">
+                            <label class="label" for="modalPic">Picture URL</label>
+                            <input
+                                id="modalPic"
+                                v-model="joinPic"
+                                class="input"
+                                type="url"
+                                placeholder="https://..."
+                            />
+                        </div>
+                        <div class="actions">
+                            <button class="btn" @click="joinFromModal" :disabled="joining">
+                                {{ joining ? "Joining..." : "Join room" }}
+                            </button>
+                            <RouterLink class="btn btn-ghost" to="/">Leave</RouterLink>
+                        </div>
+                    </div>
+                    <p v-if="joinError" class="error">{{ joinError }}</p>
+                </template>
             </div>
+        </div>
 
-            <p class="muted small" v-if="playerId">
-                Your player id: <code class="code">{{ playerId }}</code>
-            </p>
-            <p class="muted small" v-else>
-                Not joined. You can still watch the room roster via WebSocket.
-            </p>
-        </section>
     </main>
 </template>
 
@@ -502,10 +493,10 @@ const snapshot = ref(null);
 const playerId = ref("");
 const joining = ref(false);
 const leaving = ref(false);
-
-// Quick join fields
-const quickNick = ref("");
-const quickPic = ref("");
+const joinNick = ref("");
+const joinPic = ref("");
+const joinError = ref("");
+const roomClosedReason = ref("");
 
 // Owner controls / playlists
 const myPlaylists = ref([]);
@@ -525,10 +516,39 @@ const lastBuzz = ref(null);
 const wsStatus = ref("disconnected");
 let ws = null;
 
+// simple seek UI
+const seekSeconds = ref(0);
+
+const PLAYER_STORAGE_PREFIX = "ntt.player.";
+function storageKey() {
+    return `${PLAYER_STORAGE_PREFIX}${props.roomId}`;
+}
+function loadStoredPlayerId() {
+    try {
+        return sessionStorage.getItem(storageKey()) || "";
+    } catch {
+        return "";
+    }
+}
+function setPlayerId(id) {
+    const v = id || "";
+    playerId.value = v;
+    try {
+        if (v) sessionStorage.setItem(storageKey(), v);
+        else sessionStorage.removeItem(storageKey());
+    } catch {
+        // ignore
+    }
+    return v;
+}
+
+setPlayerId(loadStoredPlayerId());
+
 const canControlPlayback = computed(
     () =>
         !!snapshot.value?.playlist?.playlistId &&
-        (snapshot.value?.playlist?.items?.length || 0) > 0,
+        (snapshot.value?.playlist?.items?.length || 0) > 0 &&
+        !roomClosedReason.value,
 );
 const isOwner = computed(() => {
     const sub = auth.state.sub;
@@ -537,22 +557,83 @@ const isOwner = computed(() => {
     return sub === ownerSub;
 });
 
-// simple seek UI
-const seekSeconds = ref(0);
+const currentPlayer = computed(() => {
+    if (!snapshot.value?.players) return null;
+    if (playerId.value) {
+        const match = snapshot.value.players.find(
+            (p) => p.playerId === playerId.value,
+        );
+        if (match) return match;
+    }
+    const sub = auth.state.sub;
+    if (sub) {
+        const match = snapshot.value.players.find((p) => p.sub === sub);
+        if (match) return match;
+    }
+    return null;
+});
+
+const currentPlayerConnected = computed(
+    () => !!currentPlayer.value && currentPlayer.value.connected,
+);
+
+const showJoinModal = computed(() => {
+    if (roomClosedReason.value) return true;
+    if (!snapshot.value) return false;
+    return !currentPlayerConnected.value;
+});
+
+const closeReasonMessage = computed(() => {
+    switch (roomClosedReason.value) {
+        case "owner_timeout":
+            return "The owner left and did not return within 10 minutes. The room was closed.";
+        case "owner_left_empty":
+            return "The owner left the room and nobody was connected, so the room was closed.";
+        case "":
+            return "";
+        default:
+            return "The room was closed.";
+    }
+});
 
 async function reloadAll() {
     loadingAny.value = true;
     error.value = "";
     try {
         snapshot.value = await api.getRoom(props.gameId, props.roomId);
+        roomClosedReason.value = "";
+        syncPlayerFromSnapshot();
         // if owner, pull playlists for load action
         if (auth.isAuthenticated.value) {
             await refreshMyPlaylists();
         }
     } catch (e) {
+        if (e?.status === 404) {
+            roomClosedReason.value = roomClosedReason.value || "owner_left_empty";
+        }
         error.value = e?.message || "Failed to load room";
     } finally {
         loadingAny.value = false;
+    }
+}
+
+function syncPlayerFromSnapshot() {
+    if (!snapshot.value?.players) return;
+    if (playerId.value) {
+        const exists = snapshot.value.players.some(
+            (p) => p.playerId === playerId.value,
+        );
+        if (!exists) {
+            setPlayerId("");
+        }
+        return;
+    }
+    const sub = auth.state.sub;
+    if (sub) {
+        const match = snapshot.value.players.find((p) => p.sub === sub);
+        if (match) {
+            setPlayerId(match.playerId);
+        }
     }
 }
 
@@ -703,43 +784,51 @@ async function scoreSetPrompt(pid, current) {
 }
 
 // Player: join/leave + buzzer
-async function quickJoin() {
-    if (!props.roomId) return;
+async function joinFromModal() {
+    if (!props.roomId || roomClosedReason.value) return;
     joining.value = true;
+    joinError.value = "";
     playerError.value = "";
     try {
         const res = await api.joinRoom(props.gameId, props.roomId, {
-            nickname: quickNick.value || undefined,
-            pictureUrl: quickPic.value || undefined,
+            nickname: joinNick.value || undefined,
+            pictureUrl: joinPic.value || undefined,
         });
-        playerId.value = res?.PlayerID || res?.playerId || "";
-        // Do not apply REST snapshot; roster should update via WS `room.snapshot`.
+        setPlayerId(res?.PlayerID || res?.playerId || "");
+        roomClosedReason.value = "";
+        if (res?.snapshot) {
+            snapshot.value = res.snapshot;
+        }
+        syncPlayerFromSnapshot();
     } catch (e) {
-        playerError.value = e?.message || "Failed to join room";
+        joinError.value = e?.message || "Failed to join room";
     } finally {
         joining.value = false;
     }
 }
 
-async function leave() {
+async function leave({ silent = false } = {}) {
     if (!playerId.value) return;
-    leaving.value = true;
+    leaving.value = !silent;
     playerError.value = "";
     try {
         await api.leaveRoom(props.gameId, props.roomId, {
             playerId: playerId.value,
         });
-        playerId.value = "";
-        // Do not reload via REST; roster update comes via WS `room.snapshot`.
+        setPlayerId("");
     } catch (e) {
-        playerError.value = e?.message || "Failed to leave room";
+        if (!silent) {
+            playerError.value = e?.message || "Failed to leave room";
+        }
     } finally {
-        leaving.value = false;
+        if (!silent) {
+            leaving.value = false;
+        }
     }
 }
 
 async function buzz() {
-    if (!playerId.value) {
+    if (!currentPlayerConnected.value) {
         playerError.value = "Join the room to buzz.";
         return;
     }
@@ -784,6 +873,13 @@ function connectWS() {
             // Backend event shape: { type, roomId, ts, payload }
             if (msg?.type === "room.snapshot") {
                 snapshot.value = msg.payload;
+                roomClosedReason.value = "";
+                syncPlayerFromSnapshot();
+                return;
+            }
+
+            if (msg?.type === "room.closed") {
+                roomClosedReason.value = msg?.payload?.reason || "closed";
                 return;
             }
 
@@ -794,14 +890,6 @@ function connectWS() {
                     player: msg.payload?.player,
                 };
                 return;
-            }
-
-            // If the backend emits buzzer as a snapshot-only update in the future, we still rely on `room.snapshot`.
-
-            // If incremental events are received without snapshot refresh, you could patch state.
-            // For simplicity, we rely on periodic snapshots also being broadcast from server mutations.
-            if (msg?.type && msg?.payload && msg.type.startsWith("room.")) {
-                // ignore
             }
         } catch {
             // ignore bad frames
@@ -855,6 +943,8 @@ async function copyRoomId() {
 }
 
 onMounted(async () => {
+    roomClosedReason.value = "";
+    setPlayerId(loadStoredPlayerId());
     await reloadAll();
     connectWS();
 });
@@ -863,15 +953,20 @@ onMounted(async () => {
 watch(
     () => props.roomId,
     async () => {
+        roomClosedReason.value = "";
+        joinError.value = "";
+        snapshot.value = null;
+        setPlayerId(loadStoredPlayerId());
         await reloadAll();
         connectWS();
     },
 );
 
 onBeforeUnmount(() => {
+    leave({ silent: true });
     disconnectWS();
 });
-</script>
+</script></script>
 
 <style scoped>
 .page {
@@ -1211,5 +1306,31 @@ onBeforeUnmount(() => {
     border-radius: 8px;
     border: 1px solid var(--color-border, rgba(255, 255, 255, 0.12));
     background: rgba(255, 255, 255, 0.04);
+}
+
+.modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    z-index: 20;
+}
+
+.modal-card {
+    background: var(--color-background, rgba(20, 20, 24, 0.95));
+    border: 1px solid var(--color-border, rgba(255, 255, 255, 0.16));
+    border-radius: 14px;
+    padding: 20px;
+    width: min(760px, 100%);
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+}
+
+.info-blur {
+    background: rgba(255, 255, 255, 0.03);
+    padding: 12px;
+    border-radius: 12px;
 }
 </style>

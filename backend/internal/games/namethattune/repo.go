@@ -35,6 +35,28 @@ func NewRepo(db *pgxpool.Pool) *Repo {
 	return &Repo{db: db}
 }
 
+type JoinResult struct {
+	PlayerID        string
+	IsOwner         bool
+	ConnectedCount  int
+	OwnerConnected  bool
+	OwnerPlayerID   string
+	OwnerWasOffline bool
+}
+
+type LeaveResult struct {
+	OwnerLeft       bool
+	ConnectedAfter  int
+	OwnerConnected  bool
+	OwnerPlayerID   string
+	OwnerWasPresent bool
+}
+
+type RoomPresence struct {
+	Connected      int
+	OwnerConnected bool
+}
+
 func (r *Repo) ensureUserExists(ctx context.Context, sub string) error {
 	if sub == "" {
 		return core.ErrUnauthorized
@@ -421,15 +443,41 @@ func (r *Repo) CreateRoom(ctx context.Context, ownerSub, name string) (string, e
 		return "", err
 	}
 
-	const q = `
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return "", fmt.Errorf("create room begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	const roomQ = `
 INSERT INTO rooms (name, owner_sub)
 VALUES ($1, $2)
 RETURNING id::text;
 `
 	var roomID string
-	if err := r.db.QueryRow(ctx, q, name, ownerSub).Scan(&roomID); err != nil {
+	if err := tx.QueryRow(ctx, roomQ, name, ownerSub).Scan(&roomID); err != nil {
 		return "", fmt.Errorf("create room: %w", err)
 	}
+
+	// Auto-seat owner as a connected player (score fixed to 0).
+	nick, pic, err := r.profileDefaults(ctx, ownerSub)
+	if err != nil {
+		return "", err
+	}
+	const ownerPlayerQ = `
+INSERT INTO room_players (room_id, user_sub, nickname, picture_url, score, connected)
+VALUES ($1::uuid, $2, $3, $4, 0, TRUE)
+RETURNING id::text;
+`
+	var ownerPlayerID string
+	if err := tx.QueryRow(ctx, ownerPlayerQ, roomID, ownerSub, nick, pic).Scan(&ownerPlayerID); err != nil {
+		return "", fmt.Errorf("create room owner seat: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("create room commit: %w", err)
+	}
+	_ = ownerPlayerID
 	return roomID, nil
 }
 
@@ -507,12 +555,14 @@ WHERE id::uuid = $1;
 	// Players
 	{
 		const q = `
-SELECT id::text, COALESCE(user_sub, ''), nickname, picture_url, score, connected
+SELECT id::text, COALESCE(user_sub, '') AS user_sub, nickname, picture_url,
+       CASE WHEN COALESCE(user_sub, '') = $2 THEN 0 ELSE score END AS score,
+       connected
 FROM room_players
 WHERE room_id::uuid = $1
-ORDER BY connected DESC, score DESC, nickname ASC;
+ORDER BY (COALESCE(user_sub, '') = $2) DESC, connected DESC, score DESC, nickname ASC;
 `
-		rows, err := tx.Query(ctx, q, roomID)
+		rows, err := tx.Query(ctx, q, roomID, snap.OwnerSub)
 		if err != nil {
 			return RoomSnapshot{}, fmt.Errorf("get room players: %w", err)
 		}
@@ -588,21 +638,38 @@ WHERE id::uuid = $1 AND deleted_at IS NULL;
 	return pl, nil
 }
 
-// JoinRoom inserts a room_players row and returns playerId.
-func (r *Repo) JoinRoom(ctx context.Context, roomID, userSub, nickname, pictureURL string) (string, error) {
+// JoinRoom inserts or reactivates a room_players row and returns join metadata.
+func (r *Repo) JoinRoom(ctx context.Context, roomID, userSub, nickname, pictureURL string) (JoinResult, error) {
 	if roomID == "" {
-		return "", core.ErrInvalidInput
+		return JoinResult{}, core.ErrInvalidInput
+	}
+
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return JoinResult{}, fmt.Errorf("join room begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var ownerSub string
+	{
+		const q = `SELECT owner_sub FROM rooms WHERE id::uuid = $1 FOR SHARE;`
+		if err := tx.QueryRow(ctx, q, roomID).Scan(&ownerSub); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return JoinResult{}, core.ErrRoomNotFound
+			}
+			return JoinResult{}, fmt.Errorf("join room load: %w", err)
+		}
 	}
 
 	// If userSub is provided, ensure user exists. Also, use stored profile as defaults.
 	if userSub != "" {
 		if err := r.ensureUserExists(ctx, userSub); err != nil {
-			return "", err
+			return JoinResult{}, err
 		}
 
 		profNick, profPic, err := r.profileDefaults(ctx, userSub)
 		if err != nil {
-			return "", err
+			return JoinResult{}, err
 		}
 
 		if nickname == "" {
@@ -615,17 +682,103 @@ func (r *Repo) JoinRoom(ctx context.Context, roomID, userSub, nickname, pictureU
 		nickname = "Anonymous"
 	}
 
-	const q = `
-INSERT INTO room_players (room_id, user_sub, nickname, picture_url, connected)
-VALUES ($1::uuid, NULLIF($2,''), $3, $4, TRUE)
+	isOwner := userSub != "" && userSub == ownerSub
+
+	var playerID string
+	// If the user already has a row in this room, flip it back to connected.
+	if userSub != "" {
+		const reactivateQ = `
+SELECT id::text FROM room_players
+WHERE room_id::uuid = $1 AND user_sub = $2
+ORDER BY joined_at ASC
+LIMIT 1
+FOR UPDATE;
+`
+		err := tx.QueryRow(ctx, reactivateQ, roomID, userSub).Scan(&playerID)
+		if err == nil {
+			const upd = `
+UPDATE room_players
+SET nickname = $3,
+    picture_url = $4,
+    connected = TRUE,
+    left_at = NULL,
+    updated_at = now(),
+    score = CASE WHEN user_sub = $2 THEN 0 ELSE score END
+WHERE id::uuid = $1;
+`
+			if _, err := tx.Exec(ctx, upd, playerID, userSub, nickname, pictureURL); err != nil {
+				return JoinResult{}, fmt.Errorf("join room reactivate: %w", err)
+			}
+		} else if errors.Is(err, pgx.ErrNoRows) {
+			playerID = ""
+		} else {
+			return JoinResult{}, fmt.Errorf("join room reactivate scan: %w", err)
+		}
+	}
+
+	if playerID == "" {
+		const insQ = `
+INSERT INTO room_players (room_id, user_sub, nickname, picture_url, score, connected)
+VALUES ($1::uuid, NULLIF($2,''), $3, $4, CASE WHEN NULLIF($2,'') = $5 THEN 0 ELSE 0 END, TRUE)
 RETURNING id::text;
 `
-	var playerID string
-	if err := r.db.QueryRow(ctx, q, roomID, userSub, nickname, pictureURL).Scan(&playerID); err != nil {
-		// Likely FK violation if room doesn't exist.
-		return "", fmt.Errorf("join room: %w", err)
+		if err := tx.QueryRow(ctx, insQ, roomID, userSub, nickname, pictureURL, ownerSub).Scan(&playerID); err != nil {
+			// Likely FK violation if room doesn't exist.
+			if errors.Is(err, pgx.ErrNoRows) {
+				return JoinResult{}, core.ErrRoomNotFound
+			}
+			return JoinResult{}, fmt.Errorf("join room insert: %w", err)
+		}
 	}
-	return playerID, nil
+
+	// Count connected players (including owner).
+	var connected int
+	{
+		const q = `SELECT COUNT(1) FROM room_players WHERE room_id::uuid = $1 AND connected;`
+		if err := tx.QueryRow(ctx, q, roomID).Scan(&connected); err != nil {
+			return JoinResult{}, fmt.Errorf("join room count connected: %w", err)
+		}
+	}
+
+	ownerConnected := false
+	ownerPlayerID := ""
+	ownerWasOffline := false
+	{
+		const q = `
+SELECT id::text, connected
+FROM room_players
+WHERE room_id::uuid = $1 AND user_sub = $2
+ORDER BY joined_at ASC
+LIMIT 1;
+`
+		var connectedFlag bool
+		if err := tx.QueryRow(ctx, q, roomID, ownerSub).Scan(&ownerPlayerID, &connectedFlag); err != nil {
+			return JoinResult{}, fmt.Errorf("join room owner presence: %w", err)
+		}
+		ownerConnected = connectedFlag
+		ownerWasOffline = !connectedFlag
+	}
+
+	// Touch room updated_at for activity.
+	{
+		const q = `UPDATE rooms SET updated_at = now() WHERE id::uuid = $1;`
+		if _, err := tx.Exec(ctx, q, roomID); err != nil {
+			return JoinResult{}, fmt.Errorf("join room touch: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return JoinResult{}, fmt.Errorf("join room commit: %w", err)
+	}
+
+	return JoinResult{
+		PlayerID:        playerID,
+		IsOwner:         isOwner,
+		ConnectedCount:  connected,
+		OwnerConnected:  ownerConnected,
+		OwnerPlayerID:   ownerPlayerID,
+		OwnerWasOffline: ownerWasOffline,
+	}, nil
 }
 
 func (r *Repo) profileDefaults(ctx context.Context, sub string) (string, string, error) {
@@ -648,25 +801,90 @@ WHERE sub = $1 AND deleted_at IS NULL;
 	return nick, pic, nil
 }
 
-func (r *Repo) LeaveRoom(ctx context.Context, roomID, playerID string) error {
+func (r *Repo) LeaveRoom(ctx context.Context, roomID, playerID string) (LeaveResult, error) {
 	if roomID == "" || playerID == "" {
-		return core.ErrInvalidInput
+		return LeaveResult{}, core.ErrInvalidInput
 	}
 
-	const q = `
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return LeaveResult{}, fmt.Errorf("leave room begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var ownerSub, playerSub string
+	var ownerPlayerID string
+	{
+		const q = `
+SELECT rm.owner_sub, rp.user_sub, owner_player.id
+FROM rooms rm
+JOIN room_players rp ON rp.room_id = rm.id
+LEFT JOIN LATERAL (
+    SELECT id FROM room_players WHERE room_id = rm.id AND user_sub = rm.owner_sub ORDER BY joined_at ASC LIMIT 1
+) owner_player ON TRUE
+WHERE rm.id::uuid = $1 AND rp.id::uuid = $2
+FOR UPDATE OF rp;
+`
+		if err := tx.QueryRow(ctx, q, roomID, playerID).Scan(&ownerSub, &playerSub, &ownerPlayerID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return LeaveResult{}, core.ErrPlayerNotFound
+			}
+			return LeaveResult{}, fmt.Errorf("leave room load player: %w", err)
+		}
+	}
+
+	const upd = `
 UPDATE room_players
 SET connected = FALSE,
-    left_at = COALESCE(left_at, now())
+    left_at = COALESCE(left_at, now()),
+    updated_at = now()
 WHERE id::uuid = $1 AND room_id::uuid = $2;
 `
-	ct, err := r.db.Exec(ctx, q, playerID, roomID)
+	ct, err := tx.Exec(ctx, upd, playerID, roomID)
 	if err != nil {
-		return fmt.Errorf("leave room: %w", err)
+		return LeaveResult{}, fmt.Errorf("leave room: %w", err)
 	}
 	if ct.RowsAffected() == 0 {
-		return core.ErrPlayerNotFound
+		return LeaveResult{}, core.ErrPlayerNotFound
 	}
-	return nil
+
+	var connectedAfter int
+	{
+		const q = `SELECT COUNT(1) FROM room_players WHERE room_id::uuid = $1 AND connected;`
+		if err := tx.QueryRow(ctx, q, roomID).Scan(&connectedAfter); err != nil {
+			return LeaveResult{}, fmt.Errorf("leave room count connected: %w", err)
+		}
+	}
+
+	var ownerConnected bool
+	{
+		const q = `SELECT COUNT(1) FROM room_players WHERE room_id::uuid = $1 AND user_sub = $2 AND connected;`
+		var cnt int
+		if err := tx.QueryRow(ctx, q, roomID, ownerSub).Scan(&cnt); err != nil {
+			return LeaveResult{}, fmt.Errorf("leave room owner connected: %w", err)
+		}
+		ownerConnected = cnt > 0
+	}
+
+	// Touch room updated_at for activity.
+	{
+		const q = `UPDATE rooms SET updated_at = now() WHERE id::uuid = $1;`
+		if _, err := tx.Exec(ctx, q, roomID); err != nil {
+			return LeaveResult{}, fmt.Errorf("leave room touch: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return LeaveResult{}, fmt.Errorf("leave room commit: %w", err)
+	}
+
+	return LeaveResult{
+		OwnerLeft:       playerSub != "" && playerSub == ownerSub,
+		ConnectedAfter:  connectedAfter,
+		OwnerConnected:  ownerConnected,
+		OwnerPlayerID:   ownerPlayerID,
+		OwnerWasPresent: playerSub != "" && playerSub == ownerSub,
+	}, nil
 }
 
 func (r *Repo) KickPlayer(ctx context.Context, roomID, ownerSub, playerID string) error {
@@ -685,6 +903,26 @@ func (r *Repo) KickPlayer(ctx context.Context, roomID, ownerSub, playerID string
 		return err
 	} else if !ok {
 		return core.ErrNotOwner
+	}
+
+	// Disallow kicking the owner seat.
+	{
+		const q = `
+SELECT rp.user_sub, rm.owner_sub
+FROM room_players rp
+JOIN rooms rm ON rm.id = rp.room_id
+WHERE rp.id::uuid = $1 AND rp.room_id::uuid = $2;
+`
+		var playerSub, roomOwner string
+		if err := tx.QueryRow(ctx, q, playerID, roomID).Scan(&playerSub, &roomOwner); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return core.ErrPlayerNotFound
+			}
+			return fmt.Errorf("kick load player: %w", err)
+		}
+		if playerSub != "" && playerSub == roomOwner {
+			return core.ErrInvalidInput
+		}
 	}
 
 	const q = `DELETE FROM room_players WHERE id::uuid = $1 AND room_id::uuid = $2;`
@@ -717,6 +955,26 @@ func (r *Repo) SetScore(ctx context.Context, roomID, ownerSub, playerID string, 
 		return err
 	} else if !ok {
 		return core.ErrNotOwner
+	}
+
+	// Owner cannot have a score entry.
+	{
+		const q = `
+SELECT rp.user_sub, rm.owner_sub
+FROM room_players rp
+JOIN rooms rm ON rm.id = rp.room_id
+WHERE rp.id::uuid = $1 AND rp.room_id::uuid = $2;
+`
+		var playerSub, roomOwner string
+		if err := tx.QueryRow(ctx, q, playerID, roomID).Scan(&playerSub, &roomOwner); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return core.ErrPlayerNotFound
+			}
+			return fmt.Errorf("set score player load: %w", err)
+		}
+		if playerSub != "" && playerSub == roomOwner {
+			return core.ErrInvalidInput
+		}
 	}
 
 	const q = `
@@ -753,6 +1011,26 @@ func (r *Repo) AddScore(ctx context.Context, roomID, ownerSub, playerID string, 
 		return err
 	} else if !ok {
 		return core.ErrNotOwner
+	}
+
+	// Owner cannot have a score entry.
+	{
+		const q = `
+SELECT rp.user_sub, rm.owner_sub
+FROM room_players rp
+JOIN rooms rm ON rm.id = rp.room_id
+WHERE rp.id::uuid = $1 AND rp.room_id::uuid = $2;
+`
+		var playerSub, roomOwner string
+		if err := tx.QueryRow(ctx, q, playerID, roomID).Scan(&playerSub, &roomOwner); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return core.ErrPlayerNotFound
+			}
+			return fmt.Errorf("add score player load: %w", err)
+		}
+		if playerSub != "" && playerSub == roomOwner {
+			return core.ErrInvalidInput
+		}
 	}
 
 	const q = `
@@ -1008,6 +1286,46 @@ WHERE id::uuid = $1 AND owner_sub = $2;
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("seek commit: %w", err)
+	}
+	return nil
+}
+
+func (r *Repo) RoomPresence(ctx context.Context, roomID string) (RoomPresence, error) {
+	if roomID == "" {
+		return RoomPresence{}, core.ErrInvalidInput
+	}
+	const q = `
+SELECT
+    COALESCE(SUM(CASE WHEN rp.connected THEN 1 ELSE 0 END), 0)::int AS connected,
+    COALESCE(SUM(CASE WHEN rp.connected AND rp.user_sub = rm.owner_sub THEN 1 ELSE 0 END), 0)::int AS owner_connected
+FROM rooms rm
+LEFT JOIN room_players rp ON rp.room_id = rm.id
+WHERE rm.id::uuid = $1
+GROUP BY rm.id;
+`
+	var pres RoomPresence
+	var ownerCnt int
+	if err := r.db.QueryRow(ctx, q, roomID).Scan(&pres.Connected, &ownerCnt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return RoomPresence{}, core.ErrRoomNotFound
+		}
+		return RoomPresence{}, fmt.Errorf("room presence: %w", err)
+	}
+	pres.OwnerConnected = ownerCnt > 0
+	return pres, nil
+}
+
+func (r *Repo) DeleteRoom(ctx context.Context, roomID string) error {
+	if roomID == "" {
+		return core.ErrInvalidInput
+	}
+	const q = `DELETE FROM rooms WHERE id::uuid = $1;`
+	ct, err := r.db.Exec(ctx, q, roomID)
+	if err != nil {
+		return fmt.Errorf("delete room: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return core.ErrRoomNotFound
 	}
 	return nil
 }
