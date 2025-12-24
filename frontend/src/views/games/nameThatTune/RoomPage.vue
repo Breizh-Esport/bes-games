@@ -1,11 +1,9 @@
-﻿<template>
+<template>
     <main class="page">
         <header class="header">
             <div class="brand">
                 <div class="row row-center row-gap-sm">
-                    <RouterLink class="btn btn-ghost" to="/"
-                        >ÔåÉ Home</RouterLink
-                    >
+                    <RouterLink class="btn btn-ghost" to="/">Home</RouterLink>
                     <RouterLink class="btn btn-ghost" to="/profile"
                         >Profile</RouterLink
                     >
@@ -17,10 +15,10 @@
                 </h1>
 
                 <p class="subtitle muted" v-if="snapshot">
-                    {{ snapshot.name }} ÔÇó
+                    {{ snapshot.name }} -
                     {{ isOwner ? "Owner view" : "Player view" }}
                 </p>
-                <p class="subtitle muted" v-else>LoadingÔÇª</p>
+                <p class="subtitle muted" v-else>Loading...</p>
             </div>
 
             <div class="right">
@@ -70,7 +68,7 @@
                         @click="reloadAll"
                         :disabled="loadingAny"
                     >
-                        {{ loadingAny ? "RefreshingÔÇª" : "Refresh" }}
+                        {{ loadingAny ? "Refreshing..." : "Refresh" }}
                     </button>
                     <button
                         class="btn btn-ghost"
@@ -82,7 +80,7 @@
                 </div>
             </div>
 
-            <div v-if="!snapshot" class="muted">Loading roomÔÇª</div>
+            <div v-if="!snapshot" class="muted">Loading room...</div>
 
             <div v-else class="roster">
                 <div v-if="!snapshot.players?.length" class="muted">
@@ -128,8 +126,19 @@
                             <span
                                 >score: <strong>{{ p.score }}</strong></span
                             >
-                            <span class="dot">ÔÇó</span>
+                            <span class="dot">-</span>
                             <span class="muted">id: {{ p.playerId }}</span>
+                            <span
+                                v-if="isOwner && cooldownMsForPlayer(p) > 0"
+                                class="dot"
+                                >-</span
+                            >
+                            <span
+                                v-if="isOwner && cooldownMsForPlayer(p) > 0"
+                                class="muted"
+                                >cooldown
+                                {{ formatMs(cooldownMsForPlayer(p)) }}</span
+                            >
                         </div>
                     </div>
 
@@ -156,7 +165,7 @@
                             @click="scoreSetPrompt(p.playerId, p.score)"
                             :disabled="busyOwner"
                         >
-                            SetÔÇª
+                            Set...
                         </button>
                         <button
                             class="btn btn-danger"
@@ -170,14 +179,11 @@
             </div>
         </section>
 
-
-        <section class="card">
+        <section class="card" v-if="shouldShowBuzzer">
             <div class="row row-space">
                 <div>
-                    <h2 class="h2">Playback</h2>
-                    <p class="muted">
-                        Owner loads a playlist and controls playback. Players cannot see track details.
-                    </p>
+                    <h2 class="h2">Audio</h2>
+                    <p class="muted">Shared volume setting for all players.</p>
                 </div>
             </div>
 
@@ -186,7 +192,7 @@
             <template v-else>
                 <div class="row">
                     <div class="col">
-                        <div class="muted small">Audio</div>
+                        <div class="muted small">Volume</div>
                         <div class="strong">{{ volume }}%</div>
                     </div>
 
@@ -201,224 +207,286 @@
                             v-model.number="volume"
                         />
                     </div>
-
-                    <div class="col" v-if="isOwner">
-                        <div class="muted small">Role</div>
-                        <div class="strong">Owner</div>
-                    </div>
-                </div>
-
-                <div class="divider"></div>
-
-                <div class="row" v-if="isOwner">
-                    <div class="col">
-                        <div class="muted small">Loaded playlist</div>
-                        <div class="strong">
-                            {{ snapshot.playlist?.name || "None" }}
-                            <span v-if="snapshot.playlist" class="muted small"
-                                >({{
-                                    snapshot.playlist.items?.length || 0
-                                }}
-                                tracks)</span
-                            >
-                        </div>
-                    </div>
-
-                    <div class="col">
-                        <div class="muted small">Now playing</div>
-                        <div class="strong">
-                            <span v-if="snapshot.playback?.track">{{
-                                snapshot.playback.track.title
-                            }}</span>
-                            <span v-else class="muted">No track</span>
-                        </div>
-                    </div>
-
-                    <div class="col">
-                        <div class="muted small">State</div>
-                        <div class="strong">
-                            {{
-                                snapshot.playback?.paused ? "Paused" : "Playing"
-                            }}
-                            <span class="muted small"
-                                - pos
-                                {{
-                                    Math.floor(
-                                        (snapshot.playback?.positionMs || 0) /
-                                            1000,
-                                    )
-                                }}s</span
-                            >
-                        </div>
-                    </div>
-                </div>
-                <div v-else class="muted">
-                    Playback details are hidden for players until the owner is present.
-                </div>
-
-                <div class="divider"></div>
-
-                <div class="grid">
-                    <div class="card-inner" v-if="isOwner">
-                        <h3 class="h3">Controls</h3>
-
-                        <p v-if="ownerError" class="error">{{ ownerError }}</p>
-
-                        <div class="row">
-                            <div class="col">
-                                <label class="label" for="playlistSelect"
-                                    >Load playlist</label
-                                >
-                                <select
-                                    id="playlistSelect"
-                                    class="input"
-                                    v-model="selectedPlaylistId"
-                                >
-                                    <option value="">Select...</option>
-                                    <option
-                                        v-for="pl in myPlaylists"
-                                        :key="pl.id"
-                                        :value="pl.id"
-                                    >
-                                        {{ pl.name }} ({{
-                                            pl.items?.length || 0
-                                        }})
-                                    </option>
-                                </select>
-                            </div>
-                            <div class="actions">
-                                <button
-                                    class="btn"
-                                    @click="loadSelectedPlaylist"
-                                    :disabled="busyOwner || !selectedPlaylistId"
-                                >
-                                    Load
-                                </button>
-                                <button
-                                    class="btn btn-ghost"
-                                    @click="refreshMyPlaylists"
-                                    :disabled="busyOwner"
-                                >
-                                    Refresh playlists
-                                </button>
-                            </div>
-                        </div>
-
-                        <div class="divider"></div>
-
-                        <div class="row">
-                            <div class="actions">
-                                <button
-                                    class="btn"
-                                    @click="togglePause"
-                                    :disabled="busyOwner || !canControlPlayback"
-                                >
-                                    {{
-                                        snapshot.playback?.paused
-                                            ? "Play"
-                                            : "Pause"
-                                    }}
-                                </button>
-                                <button
-                                    class="btn btn-ghost"
-                                    @click="prevTrack"
-                                    :disabled="busyOwner || !canControlPlayback"
-                                >
-                                    Prev
-                                </button>
-                                <button
-                                    class="btn btn-ghost"
-                                    @click="nextTrack"
-                                    :disabled="busyOwner || !canControlPlayback"
-                                >
-                                    Next
-                                </button>
-                                <button
-                                    class="btn btn-ghost"
-                                    @click="restartTrack"
-                                    :disabled="busyOwner || !canControlPlayback"
-                                >
-                                    Restart
-                                </button>
-                            </div>
-                        </div>
-
-                        <div class="row">
-                            <div class="col">
-                                <label class="label" for="seek"
-                                    >Seek (seconds)</label
-                                >
-                                <input
-                                    id="seek"
-                                    class="input"
-                                    type="number"
-                                    min="0"
-                                    step="1"
-                                    v-model.number="seekSeconds"
-                                    :disabled="busyOwner || !canControlPlayback"
-                                />
-                            </div>
-                            <div class="actions">
-                                <button
-                                    class="btn btn-ghost"
-                                    @click="seekTo"
-                                    :disabled="busyOwner || !canControlPlayback"
-                                >
-                                    Seek
-                                </button>
-                            </div>
-                        </div>
-
-                        <div class="hint muted small">
-                            Note: actual audio playback is not implemented yet
-                            (YouTube embed/player). These controls broadcast
-                            state to all clients via WebSocket.
-                        </div>
-                    </div>
-
-                    <div class="card-inner" v-if="!isOwner">
-                        <h3 class="h3">Player controls</h3>
-                        <p v-if="playerError" class="error">
-                            {{ playerError }}
-                        </p>
-
-                        <div class="row">
-                            <div class="col">
-                                <div class="muted small">Buzzer</div>
-                                <div class="strong">Tap to buzz in.</div>
-                            </div>
-                            <div class="actions">
-                                <button
-                                    class="btn btn-buzz"
-                                    @click="buzz"
-                                    :disabled="!currentPlayerConnected || buzzing || roomClosedReason"
-                                >
-                                    {{ buzzing ? "Buzzing..." : "BUZZ" }}
-                                </button>
-                            </div>
-                        </div>
-
-                        <div v-if="lastBuzz" class="result">
-                            <div class="result-line">
-                                Last buzz:
-                                <strong>{{
-                                    lastBuzz.player?.nickname ||
-                                    lastBuzz.player?.Nickname ||
-                                    "unknown"
-                                }}</strong>
-                                <span class="muted small"
-                                    >? {{ formatRelative(lastBuzz.ts) }}</span
-                                >
-                            </div>
-                        </div>
-
-                        <div class="hint muted small">
-                            Stay connected; if you disconnect you will be prompted to rejoin.
-                        </div>
-                    </div>
                 </div>
             </template>
         </section>
+
+        <section class="card" v-if="isOwner">
+            <div class="row row-space">
+                <div>
+                    <h2 class="h2">Playback</h2>
+                    <p class="muted">
+                        Owner loads a playlist and controls playback.
+                    </p>
+                </div>
+            </div>
+
+            <div v-if="!snapshot" class="muted">Loading...</div>
+
+            <template v-else>
+                <p v-if="ownerError" class="error">{{ ownerError }}</p>
+
+                <div class="row">
+                    <div class="col">
+                        <label class="label" for="playlistSelect"
+                            >Playlist</label
+                        >
+                        <select
+                            id="playlistSelect"
+                            class="input"
+                            v-model="selectedPlaylistId"
+                        >
+                            <option value="">Select...</option>
+                            <option
+                                v-for="pl in myPlaylists"
+                                :key="pl.id"
+                                :value="pl.id"
+                            >
+                                {{ pl.name }} ({{ pl.items?.length || 0 }})
+                            </option>
+                        </select>
+                    </div>
+                </div>
+
+                <div
+                    class="playlist-track-list"
+                    v-if="snapshot.playlist?.items?.length"
+                >
+                    <div
+                        v-for="(track, index) in snapshot.playlist.items"
+                        :key="track.id"
+                        class="playlist-track"
+                        :class="
+                            index === snapshot.playback?.trackIndex
+                                ? 'is-current'
+                                : ''
+                        "
+                    >
+                        <div class="playlist-track-thumb">
+                            <img
+                                v-if="track.thumbnailUrl || track.thumbnailURL"
+                                :src="track.thumbnailUrl || track.thumbnailURL"
+                                alt="thumbnail"
+                            />
+                            <div v-else class="playlist-track-thumb-fallback">
+                                note
+                            </div>
+                        </div>
+                        <div class="playlist-track-main">
+                            <div class="playlist-track-title">
+                                {{ track.title }}
+                            </div>
+                            <div class="muted small">#{{ index + 1 }}</div>
+                        </div>
+                    </div>
+                </div>
+                <div v-else class="muted">No playlist loaded.</div>
+
+                <div class="divider"></div>
+
+                <div class="playback-controls">
+                    <div class="playback-buttons">
+                        <button
+                            class="icon-btn"
+                            @click="prevTrack"
+                            :disabled="busyOwner || !canControlPlayback"
+                            aria-label="Previous track"
+                        >
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                                <path d="M6 6h2v12H6V6zm3 6 9-6v12l-9-6z" />
+                            </svg>
+                        </button>
+                        <button
+                            class="icon-btn icon-main"
+                            @click="togglePause"
+                            :disabled="busyOwner || !canControlPlayback"
+                            aria-label="Play or pause"
+                        >
+                            <svg
+                                v-if="snapshot.playback?.paused"
+                                viewBox="0 0 24 24"
+                                aria-hidden="true"
+                            >
+                                <path d="M8 5v14l11-7z" />
+                            </svg>
+                            <svg v-else viewBox="0 0 24 24" aria-hidden="true">
+                                <path d="M6 5h5v14H6V5zm7 0h5v14h-5V5z" />
+                            </svg>
+                        </button>
+                        <button
+                            class="icon-btn"
+                            @click="nextTrack"
+                            :disabled="busyOwner || !canControlPlayback"
+                            aria-label="Next track"
+                        >
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                                <path d="M16 6h2v12h-2V6zM7 6l9 6-9 6V6z" />
+                            </svg>
+                        </button>
+                        <button
+                            class="icon-btn"
+                            @click="restartTrack"
+                            :disabled="busyOwner || !canControlPlayback"
+                            aria-label="Restart track"
+                        >
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                                <path
+                                    d="M12 5a7 7 0 1 1-6.32 4H3l3.5-3.5L10 9H7.82A5 5 0 1 0 12 7V5z"
+                                />
+                            </svg>
+                        </button>
+                    </div>
+
+                    <div class="playback-progress">
+                        <div
+                            class="progress-bar"
+                            :class="durationKnown ? '' : 'progress-unknown'"
+                            @click="seekFromBar"
+                        >
+                            <div
+                                class="progress-fill"
+                                :style="{ width: `${progressPercent}%` }"
+                            ></div>
+                        </div>
+                        <div class="playback-timer">
+                            {{ positionLabel }} / {{ durationLabel }}
+                        </div>
+                    </div>
+                </div>
+
+                <div class="hint muted small">
+                    Note: actual audio playback is not implemented yet (YouTube
+                    embed/player). These controls broadcast state to all clients
+                    via WebSocket.
+                </div>
+            </template>
+        </section>
+
+        <section class="card" v-if="shouldShowBuzzer">
+            <div class="row row-space">
+                <div>
+                    <h2 class="h2">Buzzer</h2>
+                    <p class="muted">Tap to buzz in.</p>
+                </div>
+            </div>
+
+            <div v-if="!snapshot" class="muted">Loading...</div>
+
+            <template v-else>
+                <p v-if="playerError" class="error">{{ playerError }}</p>
+
+                <div class="row">
+                    <div class="col">
+                        <div class="muted small">Status</div>
+                        <div class="strong">
+                            <span v-if="currentPlayerCooldownMs > 0"
+                                >Cooldown:
+                                {{ formatMs(currentPlayerCooldownMs) }}</span
+                            >
+                            <span v-else-if="!isPlaybackLive"
+                                >Waiting for playback</span
+                            >
+                            <span v-else>Ready</span>
+                        </div>
+                    </div>
+                    <div class="actions">
+                        <button
+                            class="btn btn-buzz"
+                            @click="buzz"
+                            :disabled="buzzerDisabled"
+                        >
+                            <span v-if="buzzing">Buzzing...</span>
+                            <span v-else-if="currentPlayerCooldownMs > 0"
+                                >Wait
+                                {{ formatMs(currentPlayerCooldownMs) }}</span
+                            >
+                            <span v-else-if="!isPlaybackLive">Not playing</span>
+                            <span v-else>BUZZ</span>
+                        </button>
+                    </div>
+                </div>
+
+                <div v-if="lastBuzz" class="result">
+                    <div class="result-line">
+                        Last buzz:
+                        <strong>{{
+                            lastBuzz.player?.nickname ||
+                            lastBuzz.player?.Nickname ||
+                            "unknown"
+                        }}</strong>
+                        <span class="muted small">
+                            - {{ formatRelative(lastBuzz.ts) }}
+                        </span>
+                    </div>
+                </div>
+
+                <div class="hint muted small">
+                    Stay connected; if you disconnect you will be prompted to
+                    rejoin.
+                </div>
+            </template>
+        </section>
+
+        <div v-if="buzzModal" class="modal-backdrop">
+            <div class="modal-card">
+                <h3 class="h3">Buzz!</h3>
+                <div class="buzz-modal-player">
+                    <div class="avatar">
+                        <img
+                            v-if="buzzModal.player?.pictureUrl"
+                            :src="buzzModal.player.pictureUrl"
+                            alt="avatar"
+                        />
+                        <div v-else class="avatar-fallback">
+                            {{ initialsOf(buzzModal.player?.nickname || "") }}
+                        </div>
+                    </div>
+                    <div>
+                        <div class="strong">
+                            {{
+                                buzzModal.player?.nickname ||
+                                buzzModal.playerId ||
+                                "Unknown"
+                            }}
+                        </div>
+                        <div class="muted small">
+                            Buzzed {{ formatRelative(buzzModal.ts) }}
+                        </div>
+                    </div>
+                </div>
+
+                <template v-if="isOwner">
+                    <div class="actions">
+                        <button
+                            class="btn"
+                            @click="resolveBuzz(true)"
+                            :disabled="resolvingBuzz"
+                        >
+                            {{ resolvingBuzz ? "Working..." : "Correct" }}
+                        </button>
+                        <button
+                            class="btn btn-ghost"
+                            @click="resolveBuzz(false)"
+                            :disabled="resolvingBuzz"
+                        >
+                            Wrong
+                        </button>
+                    </div>
+                </template>
+                <template v-else>
+                    <p class="muted">
+                        Waiting for the host to validate the answer.
+                    </p>
+                    <div class="actions">
+                        <button class="btn btn-ghost" @click="closeBuzzModal">
+                            Close
+                        </button>
+                    </div>
+                </template>
+            </div>
+        </div>
+
+        <div class="yt-player" :id="playerContainerId" aria-hidden="true"></div>
 
         <div v-if="showJoinModal" class="modal-backdrop">
             <div class="modal-card">
@@ -428,43 +496,80 @@
                 <p class="muted" v-if="roomClosedReason">
                     {{ closeReasonMessage }}
                 </p>
+                <div class="actions" v-if="roomClosedReason">
+                    <RouterLink class="btn btn-ghost" to="/">Leave</RouterLink>
+                </div>
                 <template v-else>
-                    <p class="muted">
-                        Enter a nickname and picture to join this room.
-                    </p>
-                    <div class="row">
-                        <div class="col">
-                            <label class="label" for="modalNick">Nickname</label>
-                            <input
-                                id="modalNick"
-                                v-model="joinNick"
-                                class="input"
-                                type="text"
-                                placeholder="Anonymous"
-                            />
-                        </div>
-                        <div class="col">
-                            <label class="label" for="modalPic">Picture URL</label>
-                            <input
-                                id="modalPic"
-                                v-model="joinPic"
-                                class="input"
-                                type="url"
-                                placeholder="https://..."
-                            />
-                        </div>
+                    <template v-if="wasKicked">
+                        <p class="muted">You were kicked by the room owner.</p>
                         <div class="actions">
-                            <button class="btn" @click="joinFromModal" :disabled="joining">
-                                {{ joining ? "Joining..." : "Join room" }}
-                            </button>
-                            <RouterLink class="btn btn-ghost" to="/">Leave</RouterLink>
+                            <RouterLink class="btn btn-ghost" to="/"
+                                >Leave</RouterLink
+                            >
                         </div>
-                    </div>
-                    <p v-if="joinError" class="error">{{ joinError }}</p>
+                    </template>
+                    <template v-else>
+                        <p class="muted">Enter a nickname to join this room.</p>
+                        <div class="row">
+                            <div class="col">
+                                <label class="label" for="modalNick"
+                                    >Nickname</label
+                                >
+                                <input
+                                    id="modalNick"
+                                    v-model="joinNick"
+                                    class="input"
+                                    type="text"
+                                    placeholder="Anonymous"
+                                />
+                            </div>
+                            <div class="col">
+                                <label class="label" for="modalPic"
+                                    >Picture URL</label
+                                >
+                                <input
+                                    id="modalPic"
+                                    v-model="joinPic"
+                                    class="input"
+                                    type="url"
+                                    placeholder="https://..."
+                                />
+                            </div>
+                            <div class="col" v-if="requiresRoomPassword">
+                                <label class="label" for="modalPassword"
+                                    >Room password</label
+                                >
+                                <input
+                                    id="modalPassword"
+                                    v-model="joinPassword"
+                                    class="input"
+                                    type="password"
+                                    placeholder="Password"
+                                    autocomplete="off"
+                                />
+                            </div>
+                            <div class="actions">
+                                <button
+                                    class="btn"
+                                    @click="joinFromModal"
+                                    :disabled="
+                                        joining ||
+                                        !joinNickTrimmed ||
+                                        (requiresRoomPassword && !joinPassword)
+                                    "
+                                >
+                                    {{ joining ? "Joining..." : "Join room" }}
+                                </button>
+                                <RouterLink class="btn btn-ghost" to="/"
+                                    >Leave</RouterLink
+                                >
+                            </div>
+                        </div>
+                        <p v-if="joinError" class="error">{{ joinError }}</p>
+                    </template>
                 </template>
             </div>
         </div>
-
     </main>
 </template>
 
@@ -485,6 +590,7 @@ const auth = useAuth();
 
 const loadingAny = ref(false);
 const error = ref("");
+const nowTick = ref(Date.now());
 
 // Room state
 const snapshot = ref(null);
@@ -493,14 +599,52 @@ const snapshot = ref(null);
 const playerId = ref("");
 const joining = ref(false);
 const leaving = ref(false);
-const joinNick = ref("");
-const joinPic = ref("");
+const NICK_STORAGE_KEY = "ntt.nickname";
+const PIC_STORAGE_KEY = "ntt.pictureUrl";
+
+function loadStoredNickname() {
+    try {
+        return localStorage.getItem(NICK_STORAGE_KEY) || "";
+    } catch {
+        return "";
+    }
+}
+
+function loadStoredPictureUrl() {
+    try {
+        return localStorage.getItem(PIC_STORAGE_KEY) || "";
+    } catch {
+        return "";
+    }
+}
+
+function saveStoredProfile(nickname, pictureUrl) {
+    try {
+        if (nickname) localStorage.setItem(NICK_STORAGE_KEY, nickname);
+        else localStorage.removeItem(NICK_STORAGE_KEY);
+        if (pictureUrl) localStorage.setItem(PIC_STORAGE_KEY, pictureUrl);
+        else localStorage.removeItem(PIC_STORAGE_KEY);
+    } catch {
+        // ignore
+    }
+}
+
+const storedNickname = ref(loadStoredNickname());
+const storedPictureUrl = ref(loadStoredPictureUrl());
+const hasStoredNickname = computed(() => !!(storedNickname.value || "").trim());
+
+const joinNick = ref(storedNickname.value);
+const joinPic = ref(storedPictureUrl.value);
+const joinNickTrimmed = computed(() => (joinNick.value || "").trim());
+const joinPassword = ref("");
 const joinError = ref("");
 const roomClosedReason = ref("");
+const wasKicked = ref(false);
 
 // Owner controls / playlists
 const myPlaylists = ref([]);
 const selectedPlaylistId = ref("");
+const suppressPlaylistLoad = ref(false);
 const busyOwner = ref(false);
 const ownerError = ref("");
 
@@ -508,6 +652,18 @@ const ownerError = ref("");
 const volume = ref(65);
 const buzzing = ref(false);
 const playerError = ref("");
+const buzzModal = ref(null);
+const resolvingBuzz = ref(false);
+const cooldownByPlayer = ref({});
+
+// YouTube playback
+const playerContainerId = computed(() => `yt-player-${props.roomId}`);
+const ytPlayer = ref(null);
+const ytReady = ref(false);
+const currentVideoId = ref("");
+let ytLoadPromise = null;
+let syncTimer = null;
+let nowTimer = null;
 
 // Buzzer events
 const lastBuzz = ref(null);
@@ -515,9 +671,6 @@ const lastBuzz = ref(null);
 // WS
 const wsStatus = ref("disconnected");
 let ws = null;
-
-// simple seek UI
-const seekSeconds = ref(0);
 
 const PLAYER_STORAGE_PREFIX = "ntt.player.";
 function storageKey() {
@@ -550,6 +703,35 @@ const canControlPlayback = computed(
         (snapshot.value?.playlist?.items?.length || 0) > 0 &&
         !roomClosedReason.value,
 );
+const playbackPositionMs = computed(() => {
+    const base = snapshot.value?.playback?.positionMs || 0;
+    if (snapshot.value?.playback?.paused) return base;
+    const updatedAt = Date.parse(snapshot.value?.playback?.updatedAt);
+    if (!Number.isFinite(updatedAt)) return base;
+    const delta = Math.max(0, nowTick.value - updatedAt);
+    return base + delta;
+});
+const durationKnown = computed(
+    () => (snapshot.value?.playback?.track?.durationSec || 0) > 0,
+);
+const effectiveDurationMs = computed(() => {
+    const durationSec = snapshot.value?.playback?.track?.durationSec || 0;
+    if (durationSec > 0) return durationSec * 1000;
+    return 180000;
+});
+const progressPercent = computed(() => {
+    const durationMs = effectiveDurationMs.value || 1;
+    const positionMs = playbackPositionMs.value || 0;
+    const pct = Math.min(1, Math.max(0, positionMs / durationMs));
+    return Math.round(pct * 100);
+});
+const positionLabel = computed(() =>
+    formatDuration(Math.floor((playbackPositionMs.value || 0) / 1000)),
+);
+const durationLabel = computed(() => {
+    const durationSec = snapshot.value?.playback?.track?.durationSec || 0;
+    return durationSec > 0 ? formatDuration(durationSec) : "--:--";
+});
 const isOwner = computed(() => {
     const sub = auth.state.sub;
     const ownerSub = snapshot.value?.ownerSub;
@@ -570,6 +752,11 @@ const currentPlayer = computed(() => {
         const match = snapshot.value.players.find((p) => p.sub === sub);
         if (match) return match;
     }
+    const nick = (storedNickname.value || "").trim();
+    if (nick) {
+        const match = snapshot.value.players.find((p) => p.nickname === nick);
+        if (match) return match;
+    }
     return null;
 });
 
@@ -577,10 +764,36 @@ const currentPlayerConnected = computed(
     () => !!currentPlayer.value && currentPlayer.value.connected,
 );
 
+const requiresRoomPassword = computed(() => !!snapshot.value?.hasPassword);
+const shouldShowBuzzer = computed(() => {
+    if (isOwner.value) return false;
+    const ownerSub = snapshot.value?.ownerSub;
+    if (!ownerSub) return true;
+    return (auth.state.sub || "") !== ownerSub;
+});
+const currentPlayerCooldownMs = computed(() =>
+    cooldownMsForPlayer(currentPlayer.value),
+);
+const isPlaybackLive = computed(
+    () =>
+        !!snapshot.value?.playback?.track && !snapshot.value?.playback?.paused,
+);
+const buzzerDisabled = computed(
+    () =>
+        !currentPlayerConnected.value ||
+        buzzing.value ||
+        !!roomClosedReason.value ||
+        currentPlayerCooldownMs.value > 0 ||
+        !isPlaybackLive.value,
+);
+
 const showJoinModal = computed(() => {
     if (roomClosedReason.value) return true;
     if (!snapshot.value) return false;
-    return !currentPlayerConnected.value;
+    if (wasKicked.value) return true;
+    if (currentPlayerConnected.value) return false;
+    if (requiresRoomPassword.value) return true;
+    return !hasStoredNickname.value;
 });
 
 const closeReasonMessage = computed(() => {
@@ -604,12 +817,16 @@ async function reloadAll() {
         roomClosedReason.value = "";
         syncPlayerFromSnapshot();
         // if owner, pull playlists for load action
-        if (auth.isAuthenticated.value) {
+        if (
+            auth.isAuthenticated.value &&
+            snapshot.value?.ownerSub === auth.state.sub
+        ) {
             await refreshMyPlaylists();
         }
     } catch (e) {
         if (e?.status === 404) {
-            roomClosedReason.value = roomClosedReason.value || "owner_left_empty";
+            roomClosedReason.value =
+                roomClosedReason.value || "owner_left_empty";
         }
         error.value = e?.message || "Failed to load room";
     } finally {
@@ -624,6 +841,9 @@ function syncPlayerFromSnapshot() {
             (p) => p.playerId === playerId.value,
         );
         if (!exists) {
+            if (!leaving.value) {
+                wasKicked.value = true;
+            }
             setPlayerId("");
         }
         return;
@@ -633,6 +853,170 @@ function syncPlayerFromSnapshot() {
         const match = snapshot.value.players.find((p) => p.sub === sub);
         if (match) {
             setPlayerId(match.playerId);
+        }
+    }
+}
+
+function getTrackVideoId(track) {
+    if (!track) return "";
+    return (
+        track.youTubeID ||
+        track.youtubeId ||
+        track.youTubeId ||
+        track.youtubeID ||
+        ""
+    );
+}
+
+function cooldownMsForPlayer(player) {
+    if (!player?.playerId) return 0;
+    const untilISO = cooldownByPlayer.value[player.playerId];
+    if (!untilISO) return 0;
+    const until = Date.parse(untilISO);
+    if (!Number.isFinite(until)) return 0;
+    return Math.max(0, until - nowTick.value);
+}
+
+function getDesiredPlayback() {
+    const track = snapshot.value?.playback?.track;
+    const videoId = getTrackVideoId(track);
+    if (!videoId) return null;
+    const paused = !!snapshot.value?.playback?.paused;
+    const base = snapshot.value?.playback?.positionMs || 0;
+    const updatedAt = Date.parse(snapshot.value?.playback?.updatedAt);
+    const delta =
+        !paused && Number.isFinite(updatedAt)
+            ? Math.max(0, nowTick.value - updatedAt)
+            : 0;
+    return {
+        videoId,
+        paused,
+        targetMs: base + delta,
+    };
+}
+
+function loadYouTubeAPI() {
+    if (ytLoadPromise) return ytLoadPromise;
+    ytLoadPromise = new Promise((resolve) => {
+        if (window.YT && window.YT.Player) {
+            resolve(window.YT);
+            return;
+        }
+
+        const existing = document.querySelector("script[data-yt-iframe]");
+        if (!existing) {
+            const script = document.createElement("script");
+            script.src = "https://www.youtube.com/iframe_api";
+            script.async = true;
+            script.defer = true;
+            script.dataset.ytIframe = "true";
+            document.head.appendChild(script);
+        }
+
+        const previous = window.onYouTubeIframeAPIReady;
+        window.onYouTubeIframeAPIReady = () => {
+            if (typeof previous === "function") previous();
+            resolve(window.YT);
+        };
+    });
+    return ytLoadPromise;
+}
+
+async function setupYouTubePlayer() {
+    const container = document.getElementById(playerContainerId.value);
+    if (!container) return;
+    const YT = await loadYouTubeAPI();
+    ytReady.value = false;
+    ytPlayer.value = new YT.Player(container, {
+        height: "0",
+        width: "0",
+        playerVars: {
+            autoplay: 0,
+            controls: 0,
+            disablekb: 1,
+            iv_load_policy: 3,
+            modestbranding: 1,
+            playsinline: 1,
+        },
+        events: {
+            onReady: () => {
+                ytReady.value = true;
+                syncPlayerToSnapshot();
+            },
+        },
+    });
+}
+
+function destroyYouTubePlayer() {
+    if (!ytPlayer.value) return;
+    try {
+        ytPlayer.value.destroy();
+    } catch {
+        // ignore
+    }
+    ytPlayer.value = null;
+    ytReady.value = false;
+    currentVideoId.value = "";
+}
+
+function syncPlayerToSnapshot() {
+    if (!ytReady.value || !ytPlayer.value) return;
+    const desired = getDesiredPlayback();
+    if (!desired) {
+        if (currentVideoId.value) {
+            try {
+                ytPlayer.value.stopVideo();
+            } catch {
+                // ignore
+            }
+        }
+        currentVideoId.value = "";
+        return;
+    }
+
+    const targetSec = Math.max(0, desired.targetMs / 1000);
+    if (currentVideoId.value !== desired.videoId) {
+        currentVideoId.value = desired.videoId;
+        ytPlayer.value.cueVideoById({
+            videoId: desired.videoId,
+            startSeconds: targetSec,
+        });
+        if (typeof ytPlayer.value.setVolume === "function") {
+            ytPlayer.value.setVolume(volume.value);
+            ytPlayer.value.unMute();
+        }
+        if (!desired.paused) {
+            ytPlayer.value.seekTo(targetSec, true);
+            ytPlayer.value.playVideo();
+        } else {
+            ytPlayer.value.pauseVideo();
+        }
+        return;
+    }
+
+    const state = ytPlayer.value.getPlayerState
+        ? ytPlayer.value.getPlayerState()
+        : null;
+    if (desired.paused) {
+        if (state !== window.YT?.PlayerState?.PAUSED) {
+            ytPlayer.value.pauseVideo();
+        }
+    } else if (state !== window.YT?.PlayerState?.PLAYING) {
+        ytPlayer.value.playVideo();
+    }
+
+    if (typeof ytPlayer.value.setVolume === "function") {
+        ytPlayer.value.setVolume(volume.value);
+        ytPlayer.value.unMute();
+    }
+
+    const currentSec = ytPlayer.value.getCurrentTime
+        ? ytPlayer.value.getCurrentTime()
+        : null;
+    if (Number.isFinite(currentSec)) {
+        const drift = Math.abs(currentSec - targetSec);
+        if (drift > 1.5) {
+            ytPlayer.value.seekTo(targetSec, true);
         }
     }
 }
@@ -716,14 +1100,13 @@ function restartTrack() {
     setTrackIndex(idx, { positionMs: 0 });
 }
 
-async function seekTo() {
-    const sec = Number(seekSeconds.value || 0);
-    if (!Number.isFinite(sec) || sec < 0) return;
+async function seekToMs(positionMs) {
+    if (!Number.isFinite(positionMs) || positionMs < 0) return;
     busyOwner.value = true;
     ownerError.value = "";
     try {
         await api.seek(props.gameId, props.roomId, {
-            positionMs: Math.floor(sec * 1000),
+            positionMs: Math.floor(positionMs),
         });
         // Do not apply REST response; wait for WS `room.snapshot`.
     } catch (e) {
@@ -731,6 +1114,15 @@ async function seekTo() {
     } finally {
         busyOwner.value = false;
     }
+}
+
+function seekFromBar(event) {
+    if (busyOwner.value || !canControlPlayback.value) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const x = Math.min(Math.max(event.clientX - rect.left, 0), rect.width);
+    const ratio = rect.width ? x / rect.width : 0;
+    const targetMs = Math.floor(effectiveDurationMs.value * ratio);
+    seekToMs(targetMs);
 }
 
 // Owner: roster controls
@@ -784,27 +1176,68 @@ async function scoreSetPrompt(pid, current) {
 }
 
 // Player: join/leave + buzzer
-async function joinFromModal() {
+async function joinRoomWithProfile({
+    nickname,
+    pictureUrl,
+    password,
+    persist = false,
+}) {
     if (!props.roomId || roomClosedReason.value) return;
+    if (currentPlayerConnected.value) return;
+    if (wasKicked.value) return;
+    const safeNickname = (nickname || "").trim();
     joining.value = true;
     joinError.value = "";
     playerError.value = "";
     try {
         const res = await api.joinRoom(props.gameId, props.roomId, {
-            nickname: joinNick.value || undefined,
-            pictureUrl: joinPic.value || undefined,
+            nickname: safeNickname || undefined,
+            pictureUrl: pictureUrl || undefined,
+            password: password || undefined,
         });
         setPlayerId(res?.PlayerID || res?.playerId || "");
+        wasKicked.value = false;
         roomClosedReason.value = "";
+        if (persist) {
+            saveStoredProfile(safeNickname || "", pictureUrl || "");
+            storedNickname.value = safeNickname || "";
+            storedPictureUrl.value = pictureUrl || "";
+        }
         if (res?.snapshot) {
             snapshot.value = res.snapshot;
         }
+        joinPassword.value = "";
         syncPlayerFromSnapshot();
     } catch (e) {
         joinError.value = e?.message || "Failed to join room";
     } finally {
         joining.value = false;
     }
+}
+
+async function joinFromModal() {
+    const nickname = joinNickTrimmed.value;
+    if (!nickname) return;
+    await joinRoomWithProfile({
+        nickname,
+        pictureUrl: joinPic.value,
+        password: joinPassword.value,
+        persist: true,
+    });
+}
+
+async function maybeAutoJoin() {
+    if (!snapshot.value) return;
+    if (roomClosedReason.value) return;
+    if (currentPlayerConnected.value) return;
+    if (requiresRoomPassword.value) return;
+    if (!hasStoredNickname.value) return;
+    if (joining.value) return;
+    await joinRoomWithProfile({
+        nickname: storedNickname.value,
+        pictureUrl: storedPictureUrl.value,
+        persist: false,
+    });
 }
 
 async function leave({ silent = false } = {}) {
@@ -845,6 +1278,27 @@ async function buzz() {
     }
 }
 
+function closeBuzzModal() {
+    buzzModal.value = null;
+}
+
+async function resolveBuzz(correct) {
+    if (!buzzModal.value?.playerId) return;
+    resolvingBuzz.value = true;
+    ownerError.value = "";
+    try {
+        await api.resolveBuzz(props.gameId, props.roomId, {
+            playerId: buzzModal.value.playerId,
+            correct,
+        });
+        buzzModal.value = null;
+    } catch (e) {
+        ownerError.value = e?.message || "Failed to resolve buzz";
+    } finally {
+        resolvingBuzz.value = false;
+    }
+}
+
 // WS connection
 function connectWS() {
     disconnectWS();
@@ -875,6 +1329,20 @@ function connectWS() {
                 snapshot.value = msg.payload;
                 roomClosedReason.value = "";
                 syncPlayerFromSnapshot();
+                if (snapshot.value?.players) {
+                    const active = new Set(
+                        snapshot.value.players.map((p) => p.playerId),
+                    );
+                    const next = {};
+                    Object.entries(cooldownByPlayer.value).forEach(
+                        ([pid, until]) => {
+                            if (active.has(pid)) {
+                                next[pid] = until;
+                            }
+                        },
+                    );
+                    cooldownByPlayer.value = next;
+                }
                 return;
             }
 
@@ -889,6 +1357,36 @@ function connectWS() {
                     ts: msg.ts || new Date().toISOString(),
                     player: msg.payload?.player,
                 };
+                buzzModal.value = {
+                    ts: msg.ts || new Date().toISOString(),
+                    player: msg.payload?.player,
+                    playerId:
+                        msg.payload?.player?.playerId ||
+                        msg.payload?.playerId ||
+                        "",
+                };
+                return;
+            }
+
+            if (msg?.type === "buzzer.resolved") {
+                buzzModal.value = null;
+                if (msg.payload?.playerId) {
+                    const next = { ...cooldownByPlayer.value };
+                    delete next[msg.payload.playerId];
+                    cooldownByPlayer.value = next;
+                }
+                return;
+            }
+
+            if (msg?.type === "buzzer.cooldown") {
+                const pid = msg.payload?.playerId;
+                const until = msg.payload?.until;
+                if (pid && until) {
+                    cooldownByPlayer.value = {
+                        ...cooldownByPlayer.value,
+                        [pid]: until,
+                    };
+                }
                 return;
             }
         } catch {
@@ -918,6 +1416,20 @@ function initialsOf(name) {
     return (a + b).toUpperCase();
 }
 
+function formatDuration(totalSec) {
+    if (!Number.isFinite(totalSec) || totalSec < 0) return "--:--";
+    const sec = Math.floor(totalSec);
+    const min = Math.floor(sec / 60);
+    const rem = sec % 60;
+    return `${min}:${String(rem).padStart(2, "0")}`;
+}
+
+function formatMs(ms) {
+    if (!Number.isFinite(ms) || ms <= 0) return "0s";
+    const sec = Math.ceil(ms / 1000);
+    return `${sec}s`;
+}
+
 function formatRelative(isoOrDate) {
     const d = new Date(isoOrDate);
     if (Number.isNaN(d.getTime())) return "unknown";
@@ -944,19 +1456,94 @@ async function copyRoomId() {
 
 onMounted(async () => {
     roomClosedReason.value = "";
+    wasKicked.value = false;
     setPlayerId(loadStoredPlayerId());
+    nowTimer = setInterval(() => {
+        nowTick.value = Date.now();
+    }, 1000);
+    await setupYouTubePlayer();
     await reloadAll();
+    await maybeAutoJoin();
     connectWS();
+    syncTimer = setInterval(() => {
+        syncPlayerToSnapshot();
+    }, 2000);
 });
+
+watch(
+    [snapshot, currentPlayerConnected, roomClosedReason, hasStoredNickname],
+    () => {
+        maybeAutoJoin();
+    },
+    { immediate: true },
+);
+
+watch(
+    () => [
+        snapshot.value?.playback?.track?.youTubeID,
+        snapshot.value?.playback?.track?.youtubeId,
+        snapshot.value?.playback?.paused,
+        snapshot.value?.playback?.positionMs,
+        snapshot.value?.playback?.updatedAt,
+    ],
+    () => {
+        syncPlayerToSnapshot();
+    },
+    { immediate: true },
+);
+
+watch(
+    () => volume.value,
+    (next) => {
+        if (!ytReady.value || !ytPlayer.value) return;
+        if (typeof ytPlayer.value.setVolume === "function") {
+            ytPlayer.value.setVolume(next);
+            ytPlayer.value.unMute();
+        }
+    },
+    { immediate: true },
+);
+
+watch(
+    () => snapshot.value?.playlist?.playlistId,
+    (next) => {
+        if (!next) {
+            if (!selectedPlaylistId.value) return;
+            suppressPlaylistLoad.value = true;
+            selectedPlaylistId.value = "";
+        } else if (next === selectedPlaylistId.value) {
+            return;
+        } else {
+            suppressPlaylistLoad.value = true;
+            selectedPlaylistId.value = next;
+        }
+        setTimeout(() => {
+            suppressPlaylistLoad.value = false;
+        }, 0);
+    },
+);
+
+watch(
+    () => selectedPlaylistId.value,
+    async (next) => {
+        if (!next || suppressPlaylistLoad.value) return;
+        if (next === snapshot.value?.playlist?.playlistId) return;
+        await loadSelectedPlaylist();
+    },
+);
 
 // reconnect WS when roomId changes
 watch(
     () => props.roomId,
     async () => {
         roomClosedReason.value = "";
+        wasKicked.value = false;
         joinError.value = "";
+        joinPassword.value = "";
         snapshot.value = null;
         setPlayerId(loadStoredPlayerId());
+        destroyYouTubePlayer();
+        await setupYouTubePlayer();
         await reloadAll();
         connectWS();
     },
@@ -965,8 +1552,11 @@ watch(
 onBeforeUnmount(() => {
     leave({ silent: true });
     disconnectWS();
+    destroyYouTubePlayer();
+    if (syncTimer) clearInterval(syncTimer);
+    if (nowTimer) clearInterval(nowTimer);
 });
-</script></script>
+</script>
 
 <style scoped>
 .page {
@@ -1269,6 +1859,146 @@ onBeforeUnmount(() => {
     background: var(--color-border, rgba(255, 255, 255, 0.12));
 }
 
+.playlist-track-list {
+    margin-top: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-height: 260px;
+    overflow-y: auto;
+    padding-right: 4px;
+}
+
+.playlist-track {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    padding: 10px 12px;
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.playlist-track.is-current {
+    border-color: rgba(100, 140, 255, 0.45);
+    background: rgba(100, 140, 255, 0.12);
+}
+
+.playlist-track-thumb {
+    width: 56px;
+    height: 56px;
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: rgba(255, 255, 255, 0.06);
+    display: grid;
+    place-items: center;
+    flex: 0 0 auto;
+}
+
+.playlist-track-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.playlist-track-thumb-fallback {
+    font-size: 1.2rem;
+    opacity: 0.75;
+}
+
+.playlist-track-main {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.playlist-track-title {
+    font-weight: 650;
+}
+
+.playback-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.playback-buttons {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.icon-btn {
+    border: 1px solid var(--color-border, rgba(255, 255, 255, 0.12));
+    background: rgba(100, 140, 255, 0.12);
+    color: inherit;
+    border-radius: 12px;
+    padding: 8px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.2s ease;
+}
+
+.icon-btn svg {
+    width: 20px;
+    height: 20px;
+    fill: currentColor;
+}
+
+.icon-btn:hover {
+    background: rgba(100, 140, 255, 0.22);
+}
+
+.icon-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
+.icon-main {
+    padding: 10px;
+    border-radius: 14px;
+    background: rgba(255, 180, 70, 0.2);
+    border-color: rgba(255, 180, 70, 0.35);
+}
+
+.playback-progress {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.progress-bar {
+    height: 10px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.08);
+    overflow: hidden;
+    cursor: pointer;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.progress-bar.progress-unknown {
+    opacity: 0.6;
+}
+
+.progress-fill {
+    height: 100%;
+    background: rgba(100, 140, 255, 0.7);
+    width: 0%;
+    transition: width 0.2s ease;
+}
+
+.playback-timer {
+    font-size: 0.9rem;
+    opacity: 0.8;
+    display: flex;
+    justify-content: flex-end;
+}
+
 .grid {
     display: grid;
     grid-template-columns: 1fr;
@@ -1295,6 +2025,29 @@ onBeforeUnmount(() => {
     gap: 8px;
     flex-wrap: wrap;
     align-items: baseline;
+}
+
+.buzz-modal-player {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    margin: 12px 0;
+}
+
+.yt-player {
+    position: fixed;
+    width: 0;
+    height: 0;
+    overflow: hidden;
+    pointer-events: none;
+    opacity: 0;
+    z-index: -1;
+}
+
+.yt-player iframe {
+    width: 0;
+    height: 0;
+    pointer-events: none;
 }
 
 .hint {

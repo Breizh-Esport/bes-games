@@ -16,12 +16,13 @@ type Playlist struct {
 }
 
 type PlaylistItem struct {
-	ID          string    `json:"id"`
-	Title       string    `json:"title"`
-	YouTubeURL  string    `json:"youTubeURL"` // keep legacy-ish name used previously in UI
-	YouTubeID   string    `json:"youTubeID"`
-	DurationSec int       `json:"durationSec"`
-	AddedAt     time.Time `json:"addedAt"`
+	ID           string    `json:"id"`
+	Title        string    `json:"title"`
+	YouTubeURL   string    `json:"youTubeURL"` // keep legacy-ish name used previously in UI
+	YouTubeID    string    `json:"youTubeID"`
+	ThumbnailURL string    `json:"thumbnailUrl"`
+	DurationSec  int       `json:"durationSec"`
+	AddedAt      time.Time `json:"addedAt"`
 }
 
 // PlaylistView is the denormalized playlist payload embedded in a room snapshot.
@@ -60,12 +61,14 @@ type PlaybackView struct {
 
 // RoomSnapshot is the main read model for room state (roster + loaded playlist + playback).
 type RoomSnapshot struct {
-	RoomID   string        `json:"roomId"`
-	Name     string        `json:"name"`
-	OwnerSub string        `json:"ownerSub,omitempty"`
-	Players  []PlayerView  `json:"players"`
-	Playlist *PlaylistView `json:"playlist,omitempty"`
-	Playback PlaybackView  `json:"playback"`
+	RoomID      string        `json:"roomId"`
+	Name        string        `json:"name"`
+	OwnerSub    string        `json:"ownerSub,omitempty"`
+	Visibility  string        `json:"visibility"`
+	HasPassword bool          `json:"hasPassword"`
+	Players     []PlayerView  `json:"players"`
+	Playlist    *PlaylistView `json:"playlist,omitempty"`
+	Playback    PlaybackView  `json:"playback"`
 }
 
 var ErrPlaylistNotFound = errorString("playlist not found")

@@ -328,6 +328,8 @@ func TestOwnerControls_ScoreAndKick(t *testing.T) {
 func TestProfileAndPlaylists_CRUDAndRoomLoad(t *testing.T) {
 	t.Parallel()
 
+	t.Setenv("BES_YOUTUBE_OEMBED_DISABLE", "1")
+
 	ctx := context.Background()
 	pool := freshDB(t, ctx)
 	srv := newTestServer(t, pool)
@@ -376,7 +378,7 @@ func TestProfileAndPlaylists_CRUDAndRoomLoad(t *testing.T) {
 
 	// POST item
 	{
-		req := httptest.NewRequest(http.MethodPost, "/api/games/name-that-tune/playlists/"+playlistID+"/items", strings.NewReader(`{"title":"Song","youtubeUrl":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/games/name-that-tune/playlists/"+playlistID+"/items", strings.NewReader(`{"youtubeUrl":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-User-Sub", ownerSub)
 		rr := httptest.NewRecorder()

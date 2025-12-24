@@ -2,8 +2,11 @@ package namethattune
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -33,6 +36,11 @@ type Repo struct {
 
 func NewRepo(db *pgxpool.Pool) *Repo {
 	return &Repo{db: db}
+}
+
+func hashRoomPassword(raw string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(raw)))
+	return hex.EncodeToString(sum[:])
 }
 
 type JoinResult struct {
@@ -262,7 +270,7 @@ RETURNING id::text, owner_sub, name, created_at, updated_at;
 	return pl, nil
 }
 
-func (r *Repo) AddPlaylistItem(ctx context.Context, ownerSub, playlistID, title, youtubeURL string) (PlaylistItem, Playlist, error) {
+func (r *Repo) AddPlaylistItem(ctx context.Context, ownerSub, playlistID, title, youtubeURL, thumbnailURL string) (PlaylistItem, Playlist, error) {
 	if ownerSub == "" {
 		return PlaylistItem{}, Playlist{}, core.ErrUnauthorized
 	}
@@ -311,11 +319,11 @@ FOR UPDATE;
 	var item PlaylistItem
 	{
 		const q = `
-INSERT INTO playlist_items (playlist_id, position, title, youtube_url, youtube_id, duration_sec)
-VALUES ($1::uuid, $2, $3, $4, $5, 0)
-RETURNING id::text, title, youtube_url, youtube_id, duration_sec, created_at;
+INSERT INTO playlist_items (playlist_id, position, title, youtube_url, youtube_id, thumbnail_url, duration_sec)
+VALUES ($1::uuid, $2, $3, $4, $5, $6, 0)
+RETURNING id::text, title, youtube_url, youtube_id, thumbnail_url, duration_sec, created_at;
 `
-		if err := tx.QueryRow(ctx, q, playlistID, pos, title, youtubeURL, yid).Scan(&item.ID, &item.Title, &item.YouTubeURL, &item.YouTubeID, &item.DurationSec, &item.AddedAt); err != nil {
+		if err := tx.QueryRow(ctx, q, playlistID, pos, title, youtubeURL, yid, thumbnailURL).Scan(&item.ID, &item.Title, &item.YouTubeURL, &item.YouTubeID, &item.ThumbnailURL, &item.DurationSec, &item.AddedAt); err != nil {
 			return PlaylistItem{}, Playlist{}, fmt.Errorf("add playlist item insert: %w", err)
 		}
 	}
@@ -342,6 +350,102 @@ RETURNING id::text, title, youtube_url, youtube_id, duration_sec, created_at;
 	return item, pl, nil
 }
 
+func (r *Repo) UpdatePlaylistItemTitle(ctx context.Context, ownerSub, playlistID, itemID, title string) (PlaylistItem, error) {
+	if ownerSub == "" {
+		return PlaylistItem{}, core.ErrUnauthorized
+	}
+	if playlistID == "" || itemID == "" || strings.TrimSpace(title) == "" {
+		return PlaylistItem{}, core.ErrInvalidInput
+	}
+
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return PlaylistItem{}, fmt.Errorf("update playlist item begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	const q = `
+UPDATE playlist_items pi
+SET title = $4
+FROM playlists p
+WHERE pi.id::uuid = $1
+  AND pi.playlist_id = p.id
+  AND p.id::uuid = $2
+  AND p.owner_sub = $3
+  AND p.deleted_at IS NULL
+RETURNING pi.id::text, pi.title, pi.youtube_url, pi.youtube_id, pi.thumbnail_url, pi.duration_sec, pi.created_at;
+`
+	var item PlaylistItem
+	if err := tx.QueryRow(ctx, q, itemID, playlistID, ownerSub, strings.TrimSpace(title)).Scan(
+		&item.ID,
+		&item.Title,
+		&item.YouTubeURL,
+		&item.YouTubeID,
+		&item.ThumbnailURL,
+		&item.DurationSec,
+		&item.AddedAt,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return PlaylistItem{}, ErrPlaylistNotFound
+		}
+		return PlaylistItem{}, fmt.Errorf("update playlist item: %w", err)
+	}
+
+	const touchQ = `UPDATE playlists SET name = name WHERE id::uuid = $1;`
+	if _, err := tx.Exec(ctx, touchQ, playlistID); err != nil {
+		return PlaylistItem{}, fmt.Errorf("update playlist item touch: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return PlaylistItem{}, fmt.Errorf("update playlist item commit: %w", err)
+	}
+
+	return item, nil
+}
+
+func (r *Repo) DeletePlaylistItem(ctx context.Context, ownerSub, playlistID, itemID string) error {
+	if ownerSub == "" {
+		return core.ErrUnauthorized
+	}
+	if playlistID == "" || itemID == "" {
+		return core.ErrInvalidInput
+	}
+
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("delete playlist item begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	const q = `
+DELETE FROM playlist_items pi
+USING playlists p
+WHERE pi.id::uuid = $1
+  AND pi.playlist_id = p.id
+  AND p.id::uuid = $2
+  AND p.owner_sub = $3
+  AND p.deleted_at IS NULL;
+`
+	ct, err := tx.Exec(ctx, q, itemID, playlistID, ownerSub)
+	if err != nil {
+		return fmt.Errorf("delete playlist item: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrPlaylistNotFound
+	}
+
+	const touchQ = `UPDATE playlists SET name = name WHERE id::uuid = $1;`
+	if _, err := tx.Exec(ctx, touchQ, playlistID); err != nil {
+		return fmt.Errorf("delete playlist item touch: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("delete playlist item commit: %w", err)
+	}
+
+	return nil
+}
+
 func (r *Repo) ListPlaylistItems(ctx context.Context, ownerSub, playlistID string) ([]PlaylistItem, error) {
 	if ownerSub == "" {
 		return nil, core.ErrUnauthorized
@@ -365,7 +469,7 @@ WHERE id::uuid = $1 AND owner_sub = $2 AND deleted_at IS NULL;
 	}
 
 	const q = `
-SELECT id::text, title, youtube_url, youtube_id, duration_sec, created_at
+SELECT id::text, title, youtube_url, youtube_id, thumbnail_url, duration_sec, created_at
 FROM playlist_items
 WHERE playlist_id::uuid = $1
 ORDER BY position ASC;
@@ -379,7 +483,7 @@ ORDER BY position ASC;
 	out := make([]PlaylistItem, 0, 16)
 	for rows.Next() {
 		var it PlaylistItem
-		if err := rows.Scan(&it.ID, &it.Title, &it.YouTubeURL, &it.YouTubeID, &it.DurationSec, &it.AddedAt); err != nil {
+		if err := rows.Scan(&it.ID, &it.Title, &it.YouTubeURL, &it.YouTubeID, &it.ThumbnailURL, &it.DurationSec, &it.AddedAt); err != nil {
 			return nil, fmt.Errorf("list playlist items scan: %w", err)
 		}
 		out = append(out, it)
@@ -392,7 +496,7 @@ ORDER BY position ASC;
 
 func (r *Repo) listPlaylistItemsTx(ctx context.Context, tx pgx.Tx, playlistID string) ([]PlaylistItem, error) {
 	const q = `
-SELECT id::text, title, youtube_url, youtube_id, duration_sec, created_at
+SELECT id::text, title, youtube_url, youtube_id, thumbnail_url, duration_sec, created_at
 FROM playlist_items
 WHERE playlist_id::uuid = $1
 ORDER BY position ASC;
@@ -406,7 +510,7 @@ ORDER BY position ASC;
 	out := make([]PlaylistItem, 0, 16)
 	for rows.Next() {
 		var it PlaylistItem
-		if err := rows.Scan(&it.ID, &it.Title, &it.YouTubeURL, &it.YouTubeID, &it.DurationSec, &it.AddedAt); err != nil {
+		if err := rows.Scan(&it.ID, &it.Title, &it.YouTubeURL, &it.YouTubeID, &it.ThumbnailURL, &it.DurationSec, &it.AddedAt); err != nil {
 			return nil, fmt.Errorf("list playlist items (tx) scan: %w", err)
 		}
 		out = append(out, it)
@@ -425,17 +529,22 @@ type DBRoomInfo struct {
 	ID            string
 	Name          string
 	OwnerSub      string
+	Visibility    string
+	HasPassword   bool
 	OnlinePlayers int
 	UpdatedAt     time.Time
 }
 
 // CreateRoom creates a room and ensures the owner exists in users.
-func (r *Repo) CreateRoom(ctx context.Context, ownerSub, name string) (string, error) {
+func (r *Repo) CreateRoom(ctx context.Context, ownerSub, name, playlistID, visibility, password string) (string, error) {
 	if ownerSub == "" {
 		return "", core.ErrUnauthorized
 	}
 	if name == "" {
 		name = "Room"
+	}
+	if visibility == "" {
+		visibility = "public"
 	}
 
 	// Ensure owner exists in users.
@@ -449,13 +558,29 @@ func (r *Repo) CreateRoom(ctx context.Context, ownerSub, name string) (string, e
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if playlistID != "" {
+		const q = `SELECT 1 FROM playlists WHERE id::uuid = $1 AND owner_sub = $2 AND deleted_at IS NULL;`
+		var one int
+		if err := tx.QueryRow(ctx, q, playlistID, ownerSub).Scan(&one); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return "", ErrPlaylistNotFound
+			}
+			return "", fmt.Errorf("create room verify playlist: %w", err)
+		}
+	}
+
+	passwordHash := ""
+	if strings.TrimSpace(password) != "" {
+		passwordHash = hashRoomPassword(password)
+	}
+
 	const roomQ = `
-INSERT INTO rooms (name, owner_sub)
-VALUES ($1, $2)
+INSERT INTO rooms (name, owner_sub, loaded_playlist_id, playback_track_index, playback_paused, playback_position_ms, playback_updated_at, visibility, password_hash)
+VALUES ($1, $2, NULLIF($3, '')::uuid, 0, TRUE, 0, now(), $4, $5)
 RETURNING id::text;
 `
 	var roomID string
-	if err := tx.QueryRow(ctx, roomQ, name, ownerSub).Scan(&roomID); err != nil {
+	if err := tx.QueryRow(ctx, roomQ, name, ownerSub, playlistID, visibility, passwordHash).Scan(&roomID); err != nil {
 		return "", fmt.Errorf("create room: %w", err)
 	}
 
@@ -487,10 +612,13 @@ SELECT
   rm.id::text,
   rm.name,
   rm.owner_sub,
+  rm.visibility,
+  rm.password_hash <> '' AS has_password,
   rm.updated_at,
   COALESCE(SUM(CASE WHEN rp.connected THEN 1 ELSE 0 END), 0)::int AS online_players
 FROM rooms rm
 LEFT JOIN room_players rp ON rp.room_id = rm.id
+WHERE rm.visibility = 'public'
 GROUP BY rm.id
 ORDER BY rm.updated_at DESC;
 `
@@ -503,7 +631,7 @@ ORDER BY rm.updated_at DESC;
 	out := make([]DBRoomInfo, 0, 16)
 	for rows.Next() {
 		var ri DBRoomInfo
-		if err := rows.Scan(&ri.ID, &ri.Name, &ri.OwnerSub, &ri.UpdatedAt, &ri.OnlinePlayers); err != nil {
+		if err := rows.Scan(&ri.ID, &ri.Name, &ri.OwnerSub, &ri.Visibility, &ri.HasPassword, &ri.UpdatedAt, &ri.OnlinePlayers); err != nil {
 			return nil, fmt.Errorf("list rooms scan: %w", err)
 		}
 		out = append(out, ri)
@@ -530,15 +658,20 @@ func (r *Repo) GetRoomSnapshot(ctx context.Context, roomID string) (RoomSnapshot
 	{
 		const q = `
 SELECT id::text, name, owner_sub, loaded_playlist_id::text,
+       visibility, password_hash,
        playback_track_index, playback_paused, playback_position_ms, playback_updated_at
 FROM rooms
 WHERE id::uuid = $1;
 `
+		var passwordHash string
+		var visibility string
 		err := tx.QueryRow(ctx, q, roomID).Scan(
 			&snap.RoomID,
 			&snap.Name,
 			&snap.OwnerSub,
 			&loadedPlaylistID,
+			&visibility,
+			&passwordHash,
 			&snap.Playback.TrackIndex,
 			&snap.Playback.Paused,
 			&snap.Playback.PositionMS,
@@ -550,6 +683,8 @@ WHERE id::uuid = $1;
 		if err != nil {
 			return RoomSnapshot{}, fmt.Errorf("get room: %w", err)
 		}
+		snap.Visibility = visibility
+		snap.HasPassword = passwordHash != ""
 	}
 
 	// Players
@@ -639,7 +774,7 @@ WHERE id::uuid = $1 AND deleted_at IS NULL;
 }
 
 // JoinRoom inserts or reactivates a room_players row and returns join metadata.
-func (r *Repo) JoinRoom(ctx context.Context, roomID, userSub, nickname, pictureURL string) (JoinResult, error) {
+func (r *Repo) JoinRoom(ctx context.Context, roomID, userSub, nickname, pictureURL, password string) (JoinResult, error) {
 	if roomID == "" {
 		return JoinResult{}, core.ErrInvalidInput
 	}
@@ -652,12 +787,16 @@ func (r *Repo) JoinRoom(ctx context.Context, roomID, userSub, nickname, pictureU
 
 	var ownerSub string
 	{
-		const q = `SELECT owner_sub FROM rooms WHERE id::uuid = $1 FOR SHARE;`
-		if err := tx.QueryRow(ctx, q, roomID).Scan(&ownerSub); err != nil {
+		const q = `SELECT owner_sub, password_hash FROM rooms WHERE id::uuid = $1 FOR SHARE;`
+		var passwordHash string
+		if err := tx.QueryRow(ctx, q, roomID).Scan(&ownerSub, &passwordHash); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return JoinResult{}, core.ErrRoomNotFound
 			}
 			return JoinResult{}, fmt.Errorf("join room load: %w", err)
+		}
+		if passwordHash != "" && hashRoomPassword(password) != passwordHash {
+			return JoinResult{}, fmt.Errorf("%w: invalid room password", core.ErrUnauthorized)
 		}
 	}
 
@@ -1313,6 +1452,85 @@ GROUP BY rm.id;
 	}
 	pres.OwnerConnected = ownerCnt > 0
 	return pres, nil
+}
+
+func (r *Repo) HandleBuzz(ctx context.Context, roomID, playerID string) (PlayerView, error) {
+	if roomID == "" || playerID == "" {
+		return PlayerView{}, core.ErrInvalidInput
+	}
+
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return PlayerView{}, fmt.Errorf("handle buzz begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var player PlayerView
+	{
+		const q = `
+SELECT id::text, COALESCE(user_sub, '') AS user_sub, nickname, picture_url, score, connected
+FROM room_players
+WHERE id::uuid = $1 AND room_id::uuid = $2
+FOR UPDATE;
+`
+		if err := tx.QueryRow(ctx, q, playerID, roomID).Scan(
+			&player.PlayerID,
+			&player.Sub,
+			&player.Nickname,
+			&player.PictureURL,
+			&player.Score,
+			&player.Connected,
+		); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return PlayerView{}, core.ErrPlayerNotFound
+			}
+			return PlayerView{}, fmt.Errorf("handle buzz player: %w", err)
+		}
+	}
+
+	now := time.Now().UTC()
+
+	{
+		var paused bool
+		var positionMS int
+		var updatedAt time.Time
+		const q = `
+SELECT playback_paused, playback_position_ms, playback_updated_at
+FROM rooms
+WHERE id::uuid = $1
+FOR UPDATE;
+`
+		if err := tx.QueryRow(ctx, q, roomID).Scan(&paused, &positionMS, &updatedAt); err != nil {
+			return PlayerView{}, fmt.Errorf("handle buzz room: %w", err)
+		}
+		if paused {
+			return PlayerView{}, core.ErrInvalidInput
+		}
+
+		if !paused {
+			elapsed := int(now.Sub(updatedAt).Milliseconds())
+			if elapsed > 0 {
+				positionMS += elapsed
+			}
+		}
+
+		const upd = `
+UPDATE rooms
+SET playback_paused = TRUE,
+    playback_position_ms = $2,
+    playback_updated_at = $3
+WHERE id::uuid = $1;
+`
+		if _, err := tx.Exec(ctx, upd, roomID, positionMS, now); err != nil {
+			return PlayerView{}, fmt.Errorf("handle buzz pause: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return PlayerView{}, fmt.Errorf("handle buzz commit: %w", err)
+	}
+
+	return player, nil
 }
 
 func (r *Repo) DeleteRoom(ctx context.Context, roomID string) error {

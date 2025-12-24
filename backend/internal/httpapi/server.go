@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -51,6 +53,7 @@ import (
 // - POST   /api/games/{gameId}/rooms/{roomId}/playback/set
 // - POST   /api/games/{gameId}/rooms/{roomId}/playback/pause
 // - POST   /api/games/{gameId}/rooms/{roomId}/playback/seek
+// - POST   /api/games/{gameId}/rooms/{roomId}/buzz/resolve
 //
 // Profile (auth required):
 // - GET    /api/me
@@ -62,6 +65,8 @@ import (
 // - POST   /api/games/{gameId}/playlists
 // - PATCH  /api/games/{gameId}/playlists/{playlistId}
 // - POST   /api/games/{gameId}/playlists/{playlistId}/items
+// - PATCH  /api/games/{gameId}/playlists/{playlistId}/items/{itemId}
+// - DELETE /api/games/{gameId}/playlists/{playlistId}/items/{itemId}
 //
 // Player actions (per-game):
 // - POST   /api/games/{gameId}/rooms/{roomId}/buzz
@@ -70,6 +75,8 @@ type Server struct {
 	nttRepo  *namethattune.Repo
 	rt       *realtime.Registry
 	rooms    *roomLifecycle
+	buzzMu   sync.Mutex
+	buzzCD   map[string]map[string]time.Time
 }
 
 type wsOriginPatternsCtxKey struct{}
@@ -95,6 +102,7 @@ func NewServer(coreRepo *core.Repo, nttRepo *namethattune.Repo, rt *realtime.Reg
 		nttRepo:  nttRepo,
 		rt:       rt,
 		rooms:    newRoomLifecycle(nttRepo, rt),
+		buzzCD:   make(map[string]map[string]time.Time),
 	}
 }
 
@@ -158,6 +166,7 @@ func (s *Server) Handler(opts Options) http.Handler {
 				rr.Post("/playback/set", s.requireAuth(s.handlePlaybackSet))
 				rr.Post("/playback/pause", s.requireAuth(s.handlePlaybackPause))
 				rr.Post("/playback/seek", s.requireAuth(s.handlePlaybackSeek))
+				rr.Post("/buzz/resolve", s.requireAuth(s.handleBuzzResolve))
 
 				// Player actions
 				rr.Post("/buzz", s.handleBuzz)
@@ -168,6 +177,8 @@ func (s *Server) Handler(opts Options) http.Handler {
 			ntt.Post("/playlists", s.requireAuth(s.handleCreatePlaylist))
 			ntt.Patch("/playlists/{playlistId}", s.requireAuth(s.handlePatchPlaylist))
 			ntt.Post("/playlists/{playlistId}/items", s.requireAuth(s.handleAddPlaylistItem))
+			ntt.Patch("/playlists/{playlistId}/items/{itemId}", s.requireAuth(s.handlePatchPlaylistItem))
+			ntt.Delete("/playlists/{playlistId}/items/{itemId}", s.requireAuth(s.handleDeletePlaylistItem))
 		})
 
 		// Profile / account
@@ -205,6 +216,10 @@ func playlistIDParam(r *http.Request) string {
 	return strings.TrimSpace(chi.URLParam(r, "playlistId"))
 }
 
+func playlistItemIDParam(r *http.Request) string {
+	return strings.TrimSpace(chi.URLParam(r, "itemId"))
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -218,6 +233,44 @@ func writeError(w http.ResponseWriter, status int, message string) {
 		"error":  message,
 		"status": status,
 	})
+}
+
+func (s *Server) buzzCooldownUntil(roomID, playerID string) (time.Time, bool) {
+	s.buzzMu.Lock()
+	defer s.buzzMu.Unlock()
+
+	room := s.buzzCD[roomID]
+	if room == nil {
+		return time.Time{}, false
+	}
+	until, ok := room[playerID]
+	return until, ok
+}
+
+func (s *Server) setBuzzCooldown(roomID, playerID string, until time.Time) {
+	s.buzzMu.Lock()
+	defer s.buzzMu.Unlock()
+
+	room := s.buzzCD[roomID]
+	if room == nil {
+		room = make(map[string]time.Time)
+		s.buzzCD[roomID] = room
+	}
+	room[playerID] = until
+}
+
+func (s *Server) clearBuzzCooldown(roomID, playerID string) {
+	s.buzzMu.Lock()
+	defer s.buzzMu.Unlock()
+
+	room := s.buzzCD[roomID]
+	if room == nil {
+		return
+	}
+	delete(room, playerID)
+	if len(room) == 0 {
+		delete(s.buzzCD, roomID)
+	}
 }
 
 func decodeJSON(r *http.Request, dst any) error {
@@ -280,6 +333,8 @@ func (s *Server) handleListRooms(w http.ResponseWriter, r *http.Request) {
 		RoomID        string    `json:"roomId"`
 		Name          string    `json:"name"`
 		OwnerSub      string    `json:"ownerSub,omitempty"`
+		Visibility    string    `json:"visibility"`
+		HasPassword   bool      `json:"hasPassword"`
 		OnlinePlayers int       `json:"onlinePlayers"`
 		Subscribers   int       `json:"subscribers"`
 		UpdatedAt     time.Time `json:"updatedAt"`
@@ -295,6 +350,8 @@ func (s *Server) handleListRooms(w http.ResponseWriter, r *http.Request) {
 			RoomID:        ri.ID,
 			Name:          ri.Name,
 			OwnerSub:      ri.OwnerSub,
+			Visibility:    ri.Visibility,
+			HasPassword:   ri.HasPassword,
 			OnlinePlayers: ri.OnlinePlayers,
 			Subscribers:   subs,
 			UpdatedAt:     ri.UpdatedAt,
@@ -312,7 +369,10 @@ func (s *Server) handleListGames(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateRoom(w http.ResponseWriter, r *http.Request) {
 	type reqBody struct {
-		Name string `json:"name"`
+		Name       string `json:"name"`
+		PlaylistID string `json:"playlistId"`
+		Visibility string `json:"visibility"`
+		Password   string `json:"password"`
 	}
 	var body reqBody
 	if err := decodeJSON(r, &body); err != nil {
@@ -320,7 +380,23 @@ func (s *Server) handleCreateRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	roomID, err := s.nttRepo.CreateRoom(r.Context(), userSub(r), strings.TrimSpace(body.Name))
+	visibility := strings.TrimSpace(body.Visibility)
+	if visibility == "" {
+		visibility = "public"
+	}
+	if visibility != "public" && visibility != "private" {
+		writeError(w, http.StatusBadRequest, "invalid room visibility")
+		return
+	}
+
+	roomID, err := s.nttRepo.CreateRoom(
+		r.Context(),
+		userSub(r),
+		strings.TrimSpace(body.Name),
+		strings.TrimSpace(body.PlaylistID),
+		visibility,
+		strings.TrimSpace(body.Password),
+	)
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -350,6 +426,7 @@ func (s *Server) handleJoinRoom(w http.ResponseWriter, r *http.Request) {
 	type reqBody struct {
 		Nickname   string `json:"nickname,omitempty"`
 		PictureURL string `json:"pictureUrl,omitempty"`
+		Password   string `json:"password,omitempty"`
 	}
 	var body reqBody
 	// Optional body. If empty, decodeJSON may return EOF; treat as ok.
@@ -358,7 +435,14 @@ func (s *Server) handleJoinRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	joinRes, err := s.nttRepo.JoinRoom(r.Context(), roomID, userSub(r), strings.TrimSpace(body.Nickname), strings.TrimSpace(body.PictureURL))
+	joinRes, err := s.nttRepo.JoinRoom(
+		r.Context(),
+		roomID,
+		userSub(r),
+		strings.TrimSpace(body.Nickname),
+		strings.TrimSpace(body.PictureURL),
+		strings.TrimSpace(body.Password),
+	)
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -657,36 +741,124 @@ func (s *Server) handleBuzz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// We don't persist buzzes in DB yet; just broadcast the event.
+	playerID := strings.TrimSpace(body.PlayerID)
+	if until, ok := s.buzzCooldownUntil(roomID, playerID); ok && until.After(time.Now().UTC()) {
+		writeError(w, http.StatusBadRequest, "buzz cooldown active")
+		return
+	}
+
+	player, err := s.nttRepo.HandleBuzz(r.Context(), roomID, playerID)
+	if err != nil {
+		status, msg := mapDomainErr(err)
+		writeError(w, status, msg)
+		return
+	}
+
 	if s.rt != nil {
-		// Best-effort include player info by fetching snapshot and matching playerId.
+		s.rt.Room(roomID).Broadcast(realtime.Event{
+			Type:   "buzzer",
+			RoomID: roomID,
+			Payload: map[string]any{
+				"player": player,
+			},
+		})
+	}
+
+	s.broadcastSnapshot(r.Context(), roomID)
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleBuzzResolve(w http.ResponseWriter, r *http.Request) {
+	roomID := roomIDParam(r)
+
+	type reqBody struct {
+		PlayerID string `json:"playerId"`
+		Correct  bool   `json:"correct"`
+	}
+	var body reqBody
+	if err := decodeJSON(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	playerID := strings.TrimSpace(body.PlayerID)
+	if playerID == "" {
+		writeError(w, http.StatusBadRequest, "invalid input")
+		return
+	}
+
+	var cooldownUntil string
+	if body.Correct {
+		s.clearBuzzCooldown(roomID, playerID)
+		if err := s.nttRepo.AddScore(r.Context(), roomID, userSub(r), playerID, 1); err != nil {
+			status, msg := mapDomainErr(err)
+			writeError(w, status, msg)
+			return
+		}
+
 		snap, err := s.nttRepo.GetRoomSnapshot(r.Context(), roomID)
-		if err == nil {
-			var pv *namethattune.PlayerView
-			for i := range snap.Players {
-				if snap.Players[i].PlayerID == strings.TrimSpace(body.PlayerID) {
-					pv = &snap.Players[i]
-					break
-				}
+		if err != nil {
+			status, msg := mapDomainErr(err)
+			writeError(w, status, msg)
+			return
+		}
+		if snap.Playlist != nil && len(snap.Playlist.Items) > 0 {
+			nextIndex := snap.Playback.TrackIndex + 1
+			max := (len(snap.Playlist.Items) - 1)
+			if nextIndex > max {
+				nextIndex = max
 			}
-			s.rt.Room(roomID).Broadcast(realtime.Event{
-				Type:   "buzzer",
-				RoomID: roomID,
-				Payload: map[string]any{
-					"player": pv,
-				},
-			})
+			paused := true
+			position := 0
+			if err := s.nttRepo.SetPlayback(r.Context(), roomID, userSub(r), nextIndex, &paused, &position); err != nil {
+				status, msg := mapDomainErr(err)
+				writeError(w, status, msg)
+				return
+			}
 		} else {
+			paused := true
+			if err := s.nttRepo.TogglePauseSafe(r.Context(), roomID, userSub(r), paused); err != nil {
+				status, msg := mapDomainErr(err)
+				writeError(w, status, msg)
+				return
+			}
+		}
+	} else {
+		const cooldown = 5 * time.Second
+		until := time.Now().UTC().Add(cooldown)
+		s.setBuzzCooldown(roomID, playerID, until)
+		cooldownUntil = until.Format(time.RFC3339Nano)
+		paused := false
+		if err := s.nttRepo.TogglePauseSafe(r.Context(), roomID, userSub(r), paused); err != nil {
+			status, msg := mapDomainErr(err)
+			writeError(w, status, msg)
+			return
+		}
+	}
+
+	if s.rt != nil {
+		s.rt.Room(roomID).Broadcast(realtime.Event{
+			Type:   "buzzer.resolved",
+			RoomID: roomID,
+			Payload: map[string]any{
+				"playerId": playerID,
+				"correct":  body.Correct,
+			},
+		})
+		if !body.Correct {
 			s.rt.Room(roomID).Broadcast(realtime.Event{
-				Type:   "buzzer",
+				Type:   "buzzer.cooldown",
 				RoomID: roomID,
 				Payload: map[string]any{
-					"playerId": strings.TrimSpace(body.PlayerID),
+					"playerId": playerID,
+					"until":    cooldownUntil,
 				},
 			})
 		}
 	}
 
+	s.broadcastSnapshot(r.Context(), roomID)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -829,7 +1001,6 @@ func (s *Server) handleAddPlaylistItem(w http.ResponseWriter, r *http.Request) {
 	playlistID := playlistIDParam(r)
 
 	type reqBody struct {
-		Title      string `json:"title"`
 		YouTubeURL string `json:"youtubeUrl"`
 	}
 	var body reqBody
@@ -838,7 +1009,15 @@ func (s *Server) handleAddPlaylistItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	item, pl, err := s.nttRepo.AddPlaylistItem(r.Context(), sub, playlistID, strings.TrimSpace(body.Title), strings.TrimSpace(body.YouTubeURL))
+	youtubeURL := strings.TrimSpace(body.YouTubeURL)
+	meta, err := namethattune.FetchYouTubeMetadata(r.Context(), youtubeURL)
+	if err != nil {
+		status, msg := mapDomainErr(fmt.Errorf("%w: %s", core.ErrInvalidInput, err.Error()))
+		writeError(w, status, msg)
+		return
+	}
+
+	item, pl, err := s.nttRepo.AddPlaylistItem(r.Context(), sub, playlistID, meta.Title, youtubeURL, meta.ThumbnailURL)
 	if err != nil {
 		status, msg := mapDomainErr(err)
 		writeError(w, status, msg)
@@ -849,6 +1028,48 @@ func (s *Server) handleAddPlaylistItem(w http.ResponseWriter, r *http.Request) {
 		"item":     item,
 		"playlist": pl,
 	})
+}
+
+func (s *Server) handlePatchPlaylistItem(w http.ResponseWriter, r *http.Request) {
+	sub := userSub(r)
+	playlistID := playlistIDParam(r)
+	itemID := playlistItemIDParam(r)
+
+	type reqBody struct {
+		Title *string `json:"title,omitempty"`
+	}
+	var body reqBody
+	if err := decodeJSON(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if body.Title == nil {
+		writeError(w, http.StatusBadRequest, "invalid input")
+		return
+	}
+
+	item, err := s.nttRepo.UpdatePlaylistItemTitle(r.Context(), sub, playlistID, itemID, *body.Title)
+	if err != nil {
+		status, msg := mapDomainErr(err)
+		writeError(w, status, msg)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, item)
+}
+
+func (s *Server) handleDeletePlaylistItem(w http.ResponseWriter, r *http.Request) {
+	sub := userSub(r)
+	playlistID := playlistIDParam(r)
+	itemID := playlistItemIDParam(r)
+
+	if err := s.nttRepo.DeletePlaylistItem(r.Context(), sub, playlistID, itemID); err != nil {
+		status, msg := mapDomainErr(err)
+		writeError(w, status, msg)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // =============================

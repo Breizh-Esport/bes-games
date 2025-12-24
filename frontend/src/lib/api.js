@@ -12,6 +12,7 @@
 
 const DEFAULT_BASE_URL = "http://localhost:8080";
 const LS_USER_SUB_KEY = "besgames.userSub";
+const LS_GUEST_SUB_KEY = "besgames.guestSub";
 
 export function getApiBaseUrl() {
   return (import.meta?.env?.VITE_API_BASE_URL || DEFAULT_BASE_URL).replace(
@@ -23,6 +24,23 @@ export function getApiBaseUrl() {
 export function getUserSub() {
   try {
     return (localStorage.getItem(LS_USER_SUB_KEY) || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function getOrCreateGuestSub() {
+  try {
+    let v = (localStorage.getItem(LS_GUEST_SUB_KEY) || "").trim();
+    if (!v) {
+      const suffix =
+        typeof crypto !== "undefined" && crypto.randomUUID
+          ? crypto.randomUUID()
+          : Math.random().toString(36).slice(2);
+      v = `guest_${suffix}`;
+      localStorage.setItem(LS_GUEST_SUB_KEY, v);
+    }
+    return v;
   } catch {
     return "";
   }
@@ -133,11 +151,11 @@ export const api = {
     return request(`${gamePrefix(gameId)}/rooms`);
   },
 
-  createRoom(gameId, { name }) {
+  createRoom(gameId, { name, playlistId, visibility, password }) {
     return request(`${gamePrefix(gameId)}/rooms`, {
       method: "POST",
       auth: true,
-      body: { name },
+      body: { name, playlistId, visibility, password },
     });
   },
 
@@ -145,13 +163,20 @@ export const api = {
     return request(`${gamePrefix(gameId)}/rooms/${encodeURIComponent(roomId)}`);
   },
 
-  joinRoom(gameId, roomId, { nickname, pictureUrl } = {}) {
+  joinRoom(gameId, roomId, { nickname, pictureUrl, password } = {}) {
+    const userSub = getUserSub();
+    const headers = {};
+    if (!userSub) {
+      const guestSub = getOrCreateGuestSub();
+      if (guestSub) headers["X-User-Sub"] = guestSub;
+    }
     return request(
       `${gamePrefix(gameId)}/rooms/${encodeURIComponent(roomId)}/join`,
       {
         method: "POST",
-        auth: false, // anonymous allowed
-        body: { nickname, pictureUrl },
+        auth: true, // use auth sub when set; otherwise attach a guest sub
+        headers,
+        body: { nickname, pictureUrl, password },
       },
     );
   },
@@ -257,6 +282,17 @@ export const api = {
     );
   },
 
+  resolveBuzz(gameId, roomId, { playerId, correct }) {
+    return request(
+      `${gamePrefix(gameId)}/rooms/${encodeURIComponent(roomId)}/buzz/resolve`,
+      {
+        method: "POST",
+        auth: true,
+        body: { playerId, correct },
+      },
+    );
+  },
+
   // Profile / account
   getMe() {
     return request("/api/me", { auth: true });
@@ -298,13 +334,34 @@ export const api = {
     );
   },
 
-  addPlaylistItem(gameId, playlistId, { title, youtubeUrl }) {
+  addPlaylistItem(gameId, playlistId, { youtubeUrl }) {
     return request(
       `${gamePrefix(gameId)}/playlists/${encodeURIComponent(playlistId)}/items`,
       {
         method: "POST",
         auth: true,
-        body: { title, youtubeUrl },
+        body: { youtubeUrl },
+      },
+    );
+  },
+
+  patchPlaylistItem(gameId, playlistId, itemId, { title }) {
+    return request(
+      `${gamePrefix(gameId)}/playlists/${encodeURIComponent(playlistId)}/items/${encodeURIComponent(itemId)}`,
+      {
+        method: "PATCH",
+        auth: true,
+        body: { title },
+      },
+    );
+  },
+
+  deletePlaylistItem(gameId, playlistId, itemId) {
+    return request(
+      `${gamePrefix(gameId)}/playlists/${encodeURIComponent(playlistId)}/items/${encodeURIComponent(itemId)}`,
+      {
+        method: "DELETE",
+        auth: true,
       },
     );
   },
