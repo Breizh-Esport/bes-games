@@ -354,10 +354,18 @@
                     </div>
                 </div>
 
+                <div
+                    v-if="waitingForBuffer"
+                    class="playback-waiting muted small"
+                >
+                    Waiting for
+                    {{ bufferingPlayers.length || "players" }} to buffer. We'll
+                    resume as soon as everyone is ready.
+                </div>
+
                 <div class="hint muted small">
-                    Note: actual audio playback is not implemented yet (YouTube
-                    embed/player). These controls broadcast state to all clients
-                    via WebSocket.
+                    Playback is synchronized via YouTube with buffered starts
+                    and periodic drift correction.
                 </div>
             </template>
         </section>
@@ -664,6 +672,9 @@ const currentVideoId = ref("");
 let ytLoadPromise = null;
 let syncTimer = null;
 let nowTimer = null;
+let startTimer = null;
+let scheduledStartAt = null;
+let lastBufferingReport = null;
 
 // Buzzer events
 const lastBuzz = ref(null);
@@ -703,12 +714,20 @@ const canControlPlayback = computed(
         (snapshot.value?.playlist?.items?.length || 0) > 0 &&
         !roomClosedReason.value,
 );
+const playbackStartAtMs = computed(() => {
+    const raw = snapshot.value?.playback?.startAt;
+    if (!raw) return null;
+    const parsed = Date.parse(raw);
+    return Number.isFinite(parsed) ? parsed : null;
+});
 const playbackPositionMs = computed(() => {
     const base = snapshot.value?.playback?.positionMs || 0;
     if (snapshot.value?.playback?.paused) return base;
+    const startAt = playbackStartAtMs.value;
     const updatedAt = Date.parse(snapshot.value?.playback?.updatedAt);
-    if (!Number.isFinite(updatedAt)) return base;
-    const delta = Math.max(0, nowTick.value - updatedAt);
+    const reference = Number.isFinite(startAt) ? startAt : updatedAt;
+    if (!Number.isFinite(reference)) return base;
+    const delta = Math.max(0, nowTick.value - reference);
     return base + delta;
 });
 const durationKnown = computed(
@@ -774,10 +793,19 @@ const shouldShowBuzzer = computed(() => {
 const currentPlayerCooldownMs = computed(() =>
     cooldownMsForPlayer(currentPlayer.value),
 );
-const isPlaybackLive = computed(
-    () =>
-        !!snapshot.value?.playback?.track && !snapshot.value?.playback?.paused,
+const bufferingPlayers = computed(
+    () => snapshot.value?.playback?.bufferingPlayers || [],
 );
+const waitingForBuffer = computed(
+    () => !!snapshot.value?.playback?.waitingForBuffer,
+);
+const isPlaybackLive = computed(() => {
+    if (!snapshot.value?.playback?.track) return false;
+    if (snapshot.value?.playback?.paused) return false;
+    const startAt = playbackStartAtMs.value;
+    if (Number.isFinite(startAt) && startAt > nowTick.value) return false;
+    return true;
+});
 const buzzerDisabled = computed(
     () =>
         !currentPlayerConnected.value ||
@@ -883,15 +911,18 @@ function getDesiredPlayback() {
     if (!videoId) return null;
     const paused = !!snapshot.value?.playback?.paused;
     const base = snapshot.value?.playback?.positionMs || 0;
+    const startAtMs = playbackStartAtMs.value;
     const updatedAt = Date.parse(snapshot.value?.playback?.updatedAt);
+    const reference = Number.isFinite(startAtMs) ? startAtMs : updatedAt;
     const delta =
-        !paused && Number.isFinite(updatedAt)
-            ? Math.max(0, nowTick.value - updatedAt)
+        !paused && Number.isFinite(reference)
+            ? Math.max(0, nowTick.value - reference)
             : 0;
     return {
         videoId,
         paused,
         targetMs: base + delta,
+        startAtMs: Number.isFinite(startAtMs) ? startAtMs : null,
     };
 }
 
@@ -937,12 +968,15 @@ async function setupYouTubePlayer() {
             iv_load_policy: 3,
             modestbranding: 1,
             playsinline: 1,
+            vq: "tiny",
         },
         events: {
             onReady: () => {
                 ytReady.value = true;
+                applyPlaybackQualityLow();
                 syncPlayerToSnapshot();
             },
+            onStateChange: handleYTStateChange,
         },
     });
 }
@@ -957,6 +991,68 @@ function destroyYouTubePlayer() {
     ytPlayer.value = null;
     ytReady.value = false;
     currentVideoId.value = "";
+    clearScheduledStart();
+}
+
+function clearScheduledStart() {
+    if (startTimer) {
+        clearTimeout(startTimer);
+    }
+    startTimer = null;
+    scheduledStartAt = null;
+}
+
+function scheduleStart(startAtMs, targetSec) {
+    if (!Number.isFinite(startAtMs)) return;
+    if (scheduledStartAt === startAtMs) return;
+    clearScheduledStart();
+    const delay = Math.max(0, startAtMs - Date.now());
+    scheduledStartAt = startAtMs;
+    startTimer = setTimeout(() => {
+        if (!ytPlayer.value) return;
+        try {
+            ytPlayer.value.seekTo(targetSec, true);
+        } catch {
+            // ignore
+        }
+        try {
+            ytPlayer.value.playVideo();
+        } catch {
+            // ignore
+        }
+    }, delay);
+}
+
+function applyPlaybackQualityLow() {
+    if (!ytPlayer.value?.setPlaybackQuality) return;
+    try {
+        ytPlayer.value.setPlaybackQuality("tiny");
+    } catch {
+        // ignore
+    }
+}
+
+function reportPlaybackBuffering(buffering) {
+    if (!currentPlayerConnected.value || !playerId.value) return;
+    if (lastBufferingReport === buffering) return;
+    lastBufferingReport = buffering;
+    api.reportPlaybackBuffering(props.gameId, props.roomId, {
+        playerId: playerId.value,
+        buffering,
+    }).catch(() => {});
+}
+
+function handleYTStateChange(evt) {
+    const state = evt?.data;
+    const YT = window.YT;
+    if (!YT?.PlayerState) return;
+    if (state === YT.PlayerState.BUFFERING) {
+        reportPlaybackBuffering(true);
+        return;
+    }
+    if (state === YT.PlayerState.CUED || state === YT.PlayerState.PLAYING) {
+        reportPlaybackBuffering(false);
+    }
 }
 
 function syncPlayerToSnapshot() {
@@ -971,25 +1067,37 @@ function syncPlayerToSnapshot() {
             }
         }
         currentVideoId.value = "";
+        clearScheduledStart();
+        reportPlaybackBuffering(false);
         return;
     }
 
     const targetSec = Math.max(0, desired.targetMs / 1000);
     if (currentVideoId.value !== desired.videoId) {
         currentVideoId.value = desired.videoId;
+        clearScheduledStart();
+        lastBufferingReport = null;
         ytPlayer.value.cueVideoById({
             videoId: desired.videoId,
             startSeconds: targetSec,
         });
+        applyPlaybackQualityLow();
         if (typeof ytPlayer.value.setVolume === "function") {
             ytPlayer.value.setVolume(volume.value);
             ytPlayer.value.unMute();
         }
-        if (!desired.paused) {
+        const waitingForStart =
+            !desired.paused &&
+            Number.isFinite(desired.startAtMs) &&
+            desired.startAtMs > nowTick.value;
+        if (!desired.paused && !waitingForStart) {
             ytPlayer.value.seekTo(targetSec, true);
             ytPlayer.value.playVideo();
         } else {
             ytPlayer.value.pauseVideo();
+            if (waitingForStart) {
+                scheduleStart(desired.startAtMs, targetSec);
+            }
         }
         return;
     }
@@ -997,11 +1105,28 @@ function syncPlayerToSnapshot() {
     const state = ytPlayer.value.getPlayerState
         ? ytPlayer.value.getPlayerState()
         : null;
+    const waitingForStart =
+        !desired.paused &&
+        Number.isFinite(desired.startAtMs) &&
+        desired.startAtMs > nowTick.value;
     if (desired.paused) {
+        clearScheduledStart();
         if (state !== window.YT?.PlayerState?.PAUSED) {
             ytPlayer.value.pauseVideo();
         }
+        if (ytPlayer.value.setPlaybackRate) {
+            ytPlayer.value.setPlaybackRate(1);
+        }
+    } else if (waitingForStart) {
+        if (state !== window.YT?.PlayerState?.PAUSED) {
+            ytPlayer.value.pauseVideo();
+        }
+        scheduleStart(desired.startAtMs, targetSec);
+        if (ytPlayer.value.setPlaybackRate) {
+            ytPlayer.value.setPlaybackRate(1);
+        }
     } else if (state !== window.YT?.PlayerState?.PLAYING) {
+        clearScheduledStart();
         ytPlayer.value.playVideo();
     }
 
@@ -1009,14 +1134,21 @@ function syncPlayerToSnapshot() {
         ytPlayer.value.setVolume(volume.value);
         ytPlayer.value.unMute();
     }
+    applyPlaybackQualityLow();
 
     const currentSec = ytPlayer.value.getCurrentTime
         ? ytPlayer.value.getCurrentTime()
         : null;
     if (Number.isFinite(currentSec)) {
-        const drift = Math.abs(currentSec - targetSec);
-        if (drift > 1.5) {
+        const drift = currentSec - targetSec;
+        const absDrift = Math.abs(drift);
+        if (absDrift > 0.2) {
             ytPlayer.value.seekTo(targetSec, true);
+        } else if (absDrift > 0.05 && ytPlayer.value.setPlaybackRate) {
+            const rate = drift > 0 ? 0.95 : 1.05;
+            ytPlayer.value.setPlaybackRate(rate);
+        } else if (ytPlayer.value.setPlaybackRate) {
+            ytPlayer.value.setPlaybackRate(1);
         }
     }
 }
@@ -1467,7 +1599,7 @@ onMounted(async () => {
     connectWS();
     syncTimer = setInterval(() => {
         syncPlayerToSnapshot();
-    }, 2000);
+    }, 1000);
 });
 
 watch(
@@ -1485,6 +1617,7 @@ watch(
         snapshot.value?.playback?.paused,
         snapshot.value?.playback?.positionMs,
         snapshot.value?.playback?.updatedAt,
+        snapshot.value?.playback?.startAt,
     ],
     () => {
         syncPlayerToSnapshot();
@@ -1555,6 +1688,7 @@ onBeforeUnmount(() => {
     destroyYouTubePlayer();
     if (syncTimer) clearInterval(syncTimer);
     if (nowTimer) clearInterval(nowTimer);
+    clearScheduledStart();
 });
 </script>
 
@@ -1921,6 +2055,10 @@ onBeforeUnmount(() => {
     display: flex;
     flex-direction: column;
     gap: 12px;
+}
+
+.playback-waiting {
+    margin-top: 8px;
 }
 
 .playback-buttons {

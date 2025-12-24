@@ -270,6 +270,17 @@ export const api = {
     );
   },
 
+  reportPlaybackBuffering(gameId, roomId, { playerId, buffering }) {
+    return request(
+      `${gamePrefix(gameId)}/rooms/${encodeURIComponent(roomId)}/playback/buffer`,
+      {
+        method: "POST",
+        auth: false,
+        body: { playerId, buffering },
+      },
+    );
+  },
+
   // Player actions
   buzz(gameId, roomId, { playerId }) {
     return request(

@@ -1533,6 +1533,62 @@ WHERE id::uuid = $1;
 	return player, nil
 }
 
+// PausePlaybackWithPosition pauses playback and updates position based on elapsed time.
+// This is used for system-driven pauses (e.g., buffering) and does not require owner auth.
+func (r *Repo) PausePlaybackWithPosition(ctx context.Context, roomID string) error {
+	if roomID == "" {
+		return core.ErrInvalidInput
+	}
+
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("pause playback begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var paused bool
+	var positionMS int
+	var updatedAt time.Time
+	const q = `
+SELECT playback_paused, playback_position_ms, playback_updated_at
+FROM rooms
+WHERE id::uuid = $1
+FOR UPDATE;
+`
+	if err := tx.QueryRow(ctx, q, roomID).Scan(&paused, &positionMS, &updatedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return core.ErrRoomNotFound
+		}
+		return fmt.Errorf("pause playback load: %w", err)
+	}
+
+	if paused {
+		return nil
+	}
+
+	now := time.Now().UTC()
+	elapsed := int(now.Sub(updatedAt).Milliseconds())
+	if elapsed > 0 {
+		positionMS += elapsed
+	}
+
+	const upd = `
+UPDATE rooms
+SET playback_paused = TRUE,
+    playback_position_ms = $2,
+    playback_updated_at = $3
+WHERE id::uuid = $1;
+`
+	if _, err := tx.Exec(ctx, upd, roomID, positionMS, now); err != nil {
+		return fmt.Errorf("pause playback update: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("pause playback commit: %w", err)
+	}
+	return nil
+}
+
 func (r *Repo) DeleteRoom(ctx context.Context, roomID string) error {
 	if roomID == "" {
 		return core.ErrInvalidInput
