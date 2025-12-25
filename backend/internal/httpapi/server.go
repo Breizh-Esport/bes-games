@@ -590,7 +590,7 @@ func (s *Server) doPlaybackSet(ctx context.Context, roomID, sub string, trackInd
 
 func (s *Server) doPlaybackPause(ctx context.Context, roomID, sub string, paused bool) (namethattune.RoomSnapshot, error) {
 	if paused {
-		if err := s.nttRepo.TogglePauseSafe(ctx, roomID, sub, true); err != nil {
+		if err := s.nttRepo.PausePlaybackWithPosition(ctx, roomID); err != nil {
 			status, msg := mapDomainErr(err)
 			return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
 		}

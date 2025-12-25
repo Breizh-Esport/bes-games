@@ -179,7 +179,7 @@
             </div>
         </section>
 
-        <section class="card" v-if="shouldShowBuzzer">
+        <section class="card" v-if="showAudioControls">
             <div class="row row-space">
                 <div>
                     <h2 class="h2">Audio</h2>
@@ -666,6 +666,7 @@ const playerError = ref("");
 const buzzModal = ref(null);
 const resolvingBuzz = ref(false);
 const cooldownByPlayer = ref({});
+const playerDurationSec = ref(0);
 
 // YouTube playback
 const playerContainerId = computed(() => `yt-player-${props.roomId}`);
@@ -678,6 +679,8 @@ let nowTimer = null;
 let startTimer = null;
 let scheduledStartAt = null;
 let lastBufferingReport = null;
+let lastPlaybackStamp = "";
+let lastPlaybackPaused = null;
 
 // Buzzer events
 const lastBuzz = ref(null);
@@ -784,11 +787,16 @@ const playbackPositionMs = computed(() => {
     const delta = Math.max(0, nowTick.value - reference);
     return base + delta;
 });
-const durationKnown = computed(
-    () => (snapshot.value?.playback?.track?.durationSec || 0) > 0,
-);
+const durationKnown = computed(() => {
+    const fromSnapshot = snapshot.value?.playback?.track?.durationSec || 0;
+    const fromPlayer = playerDurationSec.value || 0;
+    return Math.max(fromSnapshot, fromPlayer) > 0;
+});
 const effectiveDurationMs = computed(() => {
-    const durationSec = snapshot.value?.playback?.track?.durationSec || 0;
+    const durationSec = Math.max(
+        snapshot.value?.playback?.track?.durationSec || 0,
+        playerDurationSec.value || 0,
+    );
     if (durationSec > 0) return durationSec * 1000;
     return 180000;
 });
@@ -802,7 +810,10 @@ const positionLabel = computed(() =>
     formatDuration(Math.floor((playbackPositionMs.value || 0) / 1000)),
 );
 const durationLabel = computed(() => {
-    const durationSec = snapshot.value?.playback?.track?.durationSec || 0;
+    const durationSec = Math.max(
+        snapshot.value?.playback?.track?.durationSec || 0,
+        playerDurationSec.value || 0,
+    );
     return durationSec > 0 ? formatDuration(durationSec) : "--:--";
 });
 const isOwner = computed(() => {
@@ -847,6 +858,9 @@ const shouldShowBuzzer = computed(() => {
     if (!ownerSub) return true;
     return (auth.state.sub || "") !== ownerSub;
 });
+const showAudioControls = computed(
+    () => shouldShowBuzzer.value || isOwner.value,
+);
 const currentPlayerCooldownMs = computed(() =>
     cooldownMsForPlayer(currentPlayer.value),
 );
@@ -1090,6 +1104,14 @@ function applyPlaybackQualityLow() {
     }
 }
 
+function updatePlayerDuration() {
+    if (!ytReady.value || !ytPlayer.value?.getDuration) return;
+    const duration = ytPlayer.value.getDuration();
+    if (Number.isFinite(duration) && duration > 0) {
+        playerDurationSec.value = duration;
+    }
+}
+
 function reportPlaybackBuffering(buffering) {
     if (!currentPlayerConnected.value || !playerId.value) return;
     if (lastBufferingReport === buffering) return;
@@ -1118,6 +1140,16 @@ function handleYTStateChange(evt) {
 function syncPlayerToSnapshot() {
     if (!ytReady.value || !ytPlayer.value) return;
     const desired = getDesiredPlayback();
+    const playbackStamp = snapshot.value?.playback?.updatedAt || "";
+    const playbackPaused = snapshot.value?.playback?.paused ?? null;
+    if (
+        playbackStamp !== lastPlaybackStamp ||
+        playbackPaused !== lastPlaybackPaused
+    ) {
+        lastPlaybackStamp = playbackStamp;
+        lastPlaybackPaused = playbackPaused;
+        lastBufferingReport = null;
+    }
     if (!desired) {
         if (currentVideoId.value) {
             try {
@@ -1137,6 +1169,7 @@ function syncPlayerToSnapshot() {
         currentVideoId.value = desired.videoId;
         clearScheduledStart();
         lastBufferingReport = null;
+        playerDurationSec.value = 0;
         ytPlayer.value.cueVideoById({
             videoId: desired.videoId,
             startSeconds: targetSec,
@@ -1159,6 +1192,7 @@ function syncPlayerToSnapshot() {
                 scheduleStart(desired.startAtMs, targetSec);
             }
         }
+        updatePlayerDuration();
         const state = ytPlayer.value.getPlayerState
             ? ytPlayer.value.getPlayerState()
             : null;
@@ -1205,6 +1239,7 @@ function syncPlayerToSnapshot() {
         ytPlayer.value.unMute();
     }
     applyPlaybackQualityLow();
+    updatePlayerDuration();
 
     const currentSec = ytPlayer.value.getCurrentTime
         ? ytPlayer.value.getCurrentTime()
@@ -1263,7 +1298,17 @@ async function togglePause() {
     ownerError.value = "";
     try {
         const paused = !snapshot.value?.playback?.paused;
-        await ensureRoomCommand("playback.pause", { paused });
+        if (paused) {
+            const trackIndex = snapshot.value?.playback?.trackIndex ?? 0;
+            const positionMs = Math.floor(playbackPositionMs.value || 0);
+            await ensureRoomCommand("playback.set", {
+                trackIndex,
+                paused: true,
+                positionMs,
+            });
+        } else {
+            await ensureRoomCommand("playback.pause", { paused });
+        }
         // Do not apply REST response; wait for WS `room.snapshot`.
     } catch (e) {
         ownerError.value = e?.message || "Failed to toggle pause";
