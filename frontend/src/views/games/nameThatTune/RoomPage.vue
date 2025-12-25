@@ -300,7 +300,11 @@
                         <button
                             class="icon-btn icon-main"
                             @click="togglePause"
-                            :disabled="busyOwner || !canControlPlayback"
+                            :disabled="
+                                busyOwner ||
+                                !canControlPlayback ||
+                                (snapshot.playback?.paused && !canStartPlayback)
+                            "
                             aria-label="Play or pause"
                         >
                             <svg
@@ -356,12 +360,29 @@
                 </div>
 
                 <div
-                    v-if="waitingForBuffer"
+                    v-if="waitingForReady"
+                    class="playback-waiting muted small"
+                >
+                    Waiting for
+                    {{ waitingForReadyPlayers.length || "players" }} to preload.
+                    We'll start as soon as everyone is ready.
+                </div>
+
+                <div
+                    v-else-if="waitingForBuffer"
                     class="playback-waiting muted small"
                 >
                     Waiting for
                     {{ bufferingPlayers.length || "players" }} to buffer. We'll
                     resume as soon as everyone is ready.
+                </div>
+
+                <div v-if="isOwner" class="muted small">
+                    Ready:
+                    {{
+                        (snapshot?.players || []).length -
+                        waitingForReadyPlayers.length
+                    }}/{{ (snapshot?.players || []).length }}
                 </div>
 
                 <div class="hint muted small">
@@ -683,7 +704,12 @@ let lastBufferingReport = null;
 let lastPlaybackStamp = "";
 let lastPlaybackPaused = null;
 let preloadReadyTimer = null;
-const PRELOAD_READY_FRACTION = 0.08;
+let lastReadyReport = "";
+const PRELOAD_READY_FRACTION = 0.2;
+const PRELOAD_READY_MAX_WAIT_MS = 2000;
+let preloadStartAtMs = 0;
+let bufferingDelayTimer = null;
+const BUFFER_REPORT_GRACE_MS = 1000;
 
 // Buzzer events
 const lastBuzz = ref(null);
@@ -702,7 +728,7 @@ const ownerActions = new Set([
     "playback.seek",
     "buzz.resolve",
 ]);
-const playerActions = new Set(["buzz", "playback.buffer"]);
+const playerActions = new Set(["buzz", "playback.buffer", "playback.ready"]);
 
 const PLAYER_STORAGE_PREFIX = "ntt.player.";
 const PLAYER_TOKEN_PREFIX = "ntt.playerToken.";
@@ -872,6 +898,15 @@ const bufferingPlayers = computed(
 );
 const waitingForBuffer = computed(
     () => !!snapshot.value?.playback?.waitingForBuffer,
+);
+const waitingForReady = computed(
+    () => !!snapshot.value?.playback?.waitingForReady,
+);
+const waitingForReadyPlayers = computed(
+    () => snapshot.value?.playback?.waitingForReadyPlayers || [],
+);
+const canStartPlayback = computed(
+    () => waitingForReadyPlayers.value.length === 0,
 );
 const isPlaybackLive = computed(() => {
     if (!snapshot.value?.playback?.track) return false;
@@ -1081,19 +1116,65 @@ function startPreloadReadyPolling() {
     if (preloadReadyTimer) {
         clearTimeout(preloadReadyTimer);
     }
+    if (!preloadStartAtMs) {
+        preloadStartAtMs = Date.now();
+    }
     preloadReadyTimer = setTimeout(() => {
         if (!ytReady.value || !ytPlayer.value) return;
+        const desired = getDesiredPlayback();
+        if (!desired || desired.videoId !== currentVideoId.value) {
+            startPreloadReadyPolling();
+            return;
+        }
+        const state = ytPlayer.value.getPlayerState
+            ? ytPlayer.value.getPlayerState()
+            : null;
+        const YT = window.YT;
+        const stateReady =
+            state === YT?.PlayerState?.CUED ||
+            state === YT?.PlayerState?.UNSTARTED ||
+            state === YT?.PlayerState?.PAUSED ||
+            state === YT?.PlayerState?.PLAYING;
+        if (!stateReady) {
+            startPreloadReadyPolling();
+            return;
+        }
         const fraction =
             typeof ytPlayer.value.getVideoLoadedFraction === "function"
                 ? ytPlayer.value.getVideoLoadedFraction()
                 : 0;
         if (Number.isFinite(fraction) && fraction >= PRELOAD_READY_FRACTION) {
-            reportPlaybackBuffering(false);
+            reportPlaybackReady(true);
             preloadReadyTimer = null;
+            preloadStartAtMs = 0;
+            return;
+        }
+        if (
+            Date.now() - preloadStartAtMs >= PRELOAD_READY_MAX_WAIT_MS &&
+            stateReady
+        ) {
+            reportPlaybackReady(true);
+            preloadReadyTimer = null;
+            preloadStartAtMs = 0;
             return;
         }
         startPreloadReadyPolling();
     }, 250);
+}
+
+function reportPlaybackReady(ready) {
+    if (!currentPlayerConnected.value || !playerId.value) return;
+    const updatedAt = snapshot.value?.playback?.updatedAt;
+    if (!updatedAt) return;
+    const token = `${ready}:${updatedAt}`;
+    if (lastReadyReport === token) return;
+    const sent = sendRoomCommand("playback.ready", {
+        playerId: playerId.value,
+        ready,
+        playbackUpdatedAt: updatedAt,
+    });
+    if (!sent) return;
+    lastReadyReport = token;
 }
 
 function scheduleStart(startAtMs, targetSec) {
@@ -1151,10 +1232,38 @@ function handleYTStateChange(evt) {
     if (!YT?.PlayerState) return;
     if (state === YT.PlayerState.BUFFERING) {
         if (!isPlaybackLive.value) return;
+        const startAt = playbackStartAtMs.value;
+        const delay =
+            Number.isFinite(startAt) &&
+            nowTick.value < startAt + BUFFER_REPORT_GRACE_MS
+                ? startAt + BUFFER_REPORT_GRACE_MS - nowTick.value
+                : 0;
+        if (delay > 0) {
+            if (bufferingDelayTimer) {
+                clearTimeout(bufferingDelayTimer);
+            }
+            bufferingDelayTimer = setTimeout(() => {
+                if (!ytPlayer.value?.getPlayerState) return;
+                const current = ytPlayer.value.getPlayerState();
+                if (current === YT.PlayerState.BUFFERING) {
+                    reportPlaybackBuffering(true);
+                }
+            }, delay);
+            return;
+        }
         reportPlaybackBuffering(true);
         return;
     }
-    if (state === YT.PlayerState.CUED || state === YT.PlayerState.PLAYING) {
+    if (bufferingDelayTimer) {
+        clearTimeout(bufferingDelayTimer);
+        bufferingDelayTimer = null;
+    }
+    if (state === YT.PlayerState.CUED) {
+        if (!isPlaybackLive.value) return;
+        reportPlaybackBuffering(false);
+        return;
+    }
+    if (state === YT.PlayerState.PLAYING) {
         reportPlaybackBuffering(false);
     }
 }
@@ -1171,6 +1280,7 @@ function syncPlayerToSnapshot() {
         lastPlaybackStamp = playbackStamp;
         lastPlaybackPaused = playbackPaused;
         lastBufferingReport = null;
+        lastReadyReport = "";
     }
     if (!desired) {
         if (currentVideoId.value) {
@@ -1192,6 +1302,7 @@ function syncPlayerToSnapshot() {
         clearScheduledStart();
         lastBufferingReport = null;
         playerDurationSec.value = 0;
+        preloadStartAtMs = 0;
         ytPlayer.value.cueVideoById({
             videoId: desired.videoId,
             startSeconds: targetSec,
@@ -1735,6 +1846,14 @@ function connectWS() {
                 return;
             }
 
+            if (msg?.type === "playback.preload") {
+                lastReadyReport = "";
+                preloadStartAtMs = 0;
+                syncPlayerToSnapshot();
+                startPreloadReadyPolling();
+                return;
+            }
+
             if (msg?.type === "room.closed") {
                 roomClosedReason.value = msg?.payload?.reason || "closed";
                 return;
@@ -1947,6 +2066,7 @@ onBeforeUnmount(() => {
     if (nowTimer) clearInterval(nowTimer);
     clearScheduledStart();
     if (preloadReadyTimer) clearTimeout(preloadReadyTimer);
+    if (bufferingDelayTimer) clearTimeout(bufferingDelayTimer);
 });
 </script>
 

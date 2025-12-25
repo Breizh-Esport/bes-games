@@ -62,6 +62,10 @@ type PlaybackView struct {
 	BufferingPlayers []string `json:"bufferingPlayers,omitempty"`
 	// WaitingForBuffer is true when playback is paused awaiting client buffer readiness.
 	WaitingForBuffer bool `json:"waitingForBuffer,omitempty"`
+	// WaitingForReady is true when playback is paused awaiting client preload readiness.
+	WaitingForReady bool `json:"waitingForReady,omitempty"`
+	// WaitingForReadyPlayers is a list of player IDs not yet ready to play.
+	WaitingForReadyPlayers []string `json:"waitingForReadyPlayers,omitempty"`
 }
 
 // RoomSnapshot is the main read model for room state (roster + loaded playlist + playback).
