@@ -48,15 +48,6 @@ const playbackSyncLead = 1500 * time.Millisecond
 // - WS     /api/games/{gameId}/rooms/{roomId}/ws
 //
 // Owner controls (auth required; must be room owner) (per-game):
-// - POST   /api/games/{gameId}/rooms/{roomId}/kick
-// - POST   /api/games/{gameId}/rooms/{roomId}/score/set
-// - POST   /api/games/{gameId}/rooms/{roomId}/score/add
-// - POST   /api/games/{gameId}/rooms/{roomId}/playlist/load
-// - POST   /api/games/{gameId}/rooms/{roomId}/playback/set
-// - POST   /api/games/{gameId}/rooms/{roomId}/playback/pause
-// - POST   /api/games/{gameId}/rooms/{roomId}/playback/seek
-// - POST   /api/games/{gameId}/rooms/{roomId}/playback/buffer
-// - POST   /api/games/{gameId}/rooms/{roomId}/buzz/resolve
 //
 // Profile (auth required):
 // - GET    /api/me
@@ -72,7 +63,6 @@ const playbackSyncLead = 1500 * time.Millisecond
 // - DELETE /api/games/{gameId}/playlists/{playlistId}/items/{itemId}
 //
 // Player actions (per-game):
-// - POST   /api/games/{gameId}/rooms/{roomId}/buzz
 type Server struct {
 	coreRepo *core.Repo
 	nttRepo  *namethattune.Repo
@@ -171,20 +161,6 @@ func (s *Server) Handler(opts Options) http.Handler {
 				rr.Post("/leave", s.handleLeaveRoom)
 
 				rr.Get("/ws", s.handleRoomWS)
-
-				// Owner controls
-				rr.Post("/kick", s.requireAuth(s.handleKick))
-				rr.Post("/score/set", s.requireAuth(s.handleScoreSet))
-				rr.Post("/score/add", s.requireAuth(s.handleScoreAdd))
-				rr.Post("/playlist/load", s.requireAuth(s.handleLoadPlaylist))
-				rr.Post("/playback/set", s.requireAuth(s.handlePlaybackSet))
-				rr.Post("/playback/pause", s.requireAuth(s.handlePlaybackPause))
-				rr.Post("/playback/seek", s.requireAuth(s.handlePlaybackSeek))
-				rr.Post("/buzz/resolve", s.requireAuth(s.handleBuzzResolve))
-
-				// Player actions
-				rr.Post("/buzz", s.handleBuzz)
-				rr.Post("/playback/buffer", s.handlePlaybackBuffering)
 			})
 
 			// Game-specific playlists (owned by the authenticated user).
@@ -248,6 +224,26 @@ func writeError(w http.ResponseWriter, status int, message string) {
 		"error":  message,
 		"status": status,
 	})
+}
+
+type apiError struct {
+	Status  int
+	Message string
+}
+
+func (e *apiError) Error() string {
+	return e.Message
+}
+
+func mapAPIError(err error) (int, string) {
+	if err == nil {
+		return http.StatusOK, ""
+	}
+	var apiErr *apiError
+	if errors.As(err, &apiErr) {
+		return apiErr.Status, apiErr.Message
+	}
+	return http.StatusInternalServerError, "internal server error"
 }
 
 func (s *Server) buzzCooldownUntil(roomID, playerID string) (time.Time, bool) {
@@ -390,7 +386,7 @@ func (s *Server) setPlaybackStartAt(roomID string, startAt time.Time) {
 	s.playbackStartAt[roomID] = startAt
 }
 
-func (s *Server) playbackStartAt(roomID string) (time.Time, bool) {
+func (s *Server) getPlaybackStartAt(roomID string) (time.Time, bool) {
 	s.playbackMu.Lock()
 	defer s.playbackMu.Unlock()
 	startAt, ok := s.playbackStartAt[roomID]
@@ -429,11 +425,350 @@ func (s *Server) clearPlaybackState(roomID string) {
 	delete(s.playbackAutoPause, roomID)
 }
 
+// =============================
+// Room actions (shared by REST and WS)
+// =============================
+
+func (s *Server) doKick(ctx context.Context, roomID, sub, playerID string) (namethattune.RoomSnapshot, error) {
+	if err := s.nttRepo.KickPlayer(ctx, roomID, sub, strings.TrimSpace(playerID)); err != nil {
+		status, msg := mapDomainErr(err)
+		return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+	}
+
+	snap, err := s.loadRoomSnapshot(ctx, roomID)
+	if err != nil {
+		status, msg := mapDomainErr(err)
+		return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+	}
+
+	s.broadcastSnapshot(ctx, roomID)
+	return snap, nil
+}
+
+func (s *Server) doScoreSet(ctx context.Context, roomID, sub, playerID string, score int) (namethattune.RoomSnapshot, error) {
+	if err := s.nttRepo.SetScore(ctx, roomID, sub, strings.TrimSpace(playerID), score); err != nil {
+		status, msg := mapDomainErr(err)
+		return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+	}
+
+	snap, err := s.loadRoomSnapshot(ctx, roomID)
+	if err != nil {
+		status, msg := mapDomainErr(err)
+		return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+	}
+
+	s.broadcastSnapshot(ctx, roomID)
+	return snap, nil
+}
+
+func (s *Server) doScoreAdd(ctx context.Context, roomID, sub, playerID string, delta int) (namethattune.RoomSnapshot, error) {
+	if err := s.nttRepo.AddScore(ctx, roomID, sub, strings.TrimSpace(playerID), delta); err != nil {
+		status, msg := mapDomainErr(err)
+		return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+	}
+
+	snap, err := s.loadRoomSnapshot(ctx, roomID)
+	if err != nil {
+		status, msg := mapDomainErr(err)
+		return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+	}
+
+	s.broadcastSnapshot(ctx, roomID)
+	return snap, nil
+}
+
+func (s *Server) doLoadPlaylist(ctx context.Context, roomID, sub, playlistID string) (namethattune.RoomSnapshot, error) {
+	if err := s.nttRepo.LoadPlaylistToRoom(ctx, roomID, sub, strings.TrimSpace(playlistID)); err != nil {
+		status, msg := mapDomainErr(err)
+		return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+	}
+
+	s.clearPlaybackState(roomID)
+	snap, err := s.loadRoomSnapshot(ctx, roomID)
+	if err != nil {
+		status, msg := mapDomainErr(err)
+		return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+	}
+
+	s.broadcastSnapshot(ctx, roomID)
+	return snap, nil
+}
+
+func (s *Server) doPlaybackSet(ctx context.Context, roomID, sub string, trackIndex int, paused *bool, positionMS *int) (namethattune.RoomSnapshot, error) {
+	if err := s.nttRepo.SetPlayback(ctx, roomID, sub, trackIndex, paused, positionMS); err != nil {
+		status, msg := mapDomainErr(err)
+		return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+	}
+
+	s.clearPlaybackState(roomID)
+	snap, err := s.loadRoomSnapshot(ctx, roomID)
+	if err != nil {
+		status, msg := mapDomainErr(err)
+		return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+	}
+
+	s.broadcastSnapshot(ctx, roomID)
+	return snap, nil
+}
+
+func (s *Server) doPlaybackPause(ctx context.Context, roomID, sub string, paused bool) (namethattune.RoomSnapshot, error) {
+	if paused {
+		if err := s.nttRepo.TogglePauseSafe(ctx, roomID, sub, true); err != nil {
+			status, msg := mapDomainErr(err)
+			return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+		}
+		s.setPlaybackPending(roomID, false)
+		s.clearPlaybackStartAt(roomID)
+		s.setPlaybackAutoPause(roomID, false)
+
+		snap, err := s.loadRoomSnapshot(ctx, roomID)
+		if err != nil {
+			status, msg := mapDomainErr(err)
+			return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+		}
+
+		s.broadcastSnapshot(ctx, roomID)
+		return snap, nil
+	}
+
+	snap, err := s.loadRoomSnapshot(ctx, roomID)
+	if err != nil {
+		status, msg := mapDomainErr(err)
+		return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+	}
+
+	if !s.allPlayersReady(roomID, snap.Players) {
+		s.setPlaybackPending(roomID, true)
+		s.clearPlaybackStartAt(roomID)
+		s.setPlaybackAutoPause(roomID, false)
+		s.decorateSnapshot(roomID, &snap)
+		s.broadcastSnapshot(ctx, roomID)
+		return snap, nil
+	}
+
+	if err := s.nttRepo.TogglePauseSafe(ctx, roomID, sub, false); err != nil {
+		status, msg := mapDomainErr(err)
+		return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+	}
+
+	startAt := time.Now().UTC().Add(playbackSyncLead)
+	s.setPlaybackStartAt(roomID, startAt)
+	s.setPlaybackPending(roomID, false)
+	s.setPlaybackAutoPause(roomID, false)
+
+	snap, err = s.loadRoomSnapshot(ctx, roomID)
+	if err != nil {
+		status, msg := mapDomainErr(err)
+		return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+	}
+
+	s.broadcastSnapshot(ctx, roomID)
+	return snap, nil
+}
+
+func (s *Server) doPlaybackSeek(ctx context.Context, roomID, sub string, positionMS int) (namethattune.RoomSnapshot, error) {
+	if err := s.nttRepo.Seek(ctx, roomID, sub, positionMS); err != nil {
+		status, msg := mapDomainErr(err)
+		return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+	}
+
+	s.setPlaybackPending(roomID, false)
+	s.clearPlaybackStartAt(roomID)
+	snap, err := s.loadRoomSnapshot(ctx, roomID)
+	if err != nil {
+		status, msg := mapDomainErr(err)
+		return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+	}
+
+	s.broadcastSnapshot(ctx, roomID)
+	return snap, nil
+}
+
+func (s *Server) doPlaybackBuffering(ctx context.Context, roomID, playerID string, buffering bool) (namethattune.RoomSnapshot, error) {
+	playerID = strings.TrimSpace(playerID)
+	if playerID == "" {
+		return namethattune.RoomSnapshot{}, &apiError{Status: http.StatusBadRequest, Message: "invalid input"}
+	}
+
+	snap, err := s.loadRoomSnapshot(ctx, roomID)
+	if err != nil {
+		status, msg := mapDomainErr(err)
+		return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+	}
+
+	var player *namethattune.PlayerView
+	for i := range snap.Players {
+		if snap.Players[i].PlayerID == playerID {
+			player = &snap.Players[i]
+			break
+		}
+	}
+	if player == nil {
+		return namethattune.RoomSnapshot{}, &apiError{Status: http.StatusNotFound, Message: "player not found"}
+	}
+	if !player.Connected {
+		return snap, nil
+	}
+
+	s.setPlaybackBuffering(roomID, playerID, buffering)
+	s.setPlaybackReady(roomID, playerID, !buffering)
+
+	now := time.Now().UTC()
+	startAt := snap.Playback.StartAt
+	waitingToStart := startAt != nil && startAt.After(now)
+
+	if buffering {
+		if !snap.Playback.Paused && !waitingToStart {
+			if err := s.nttRepo.PausePlaybackWithPosition(ctx, roomID); err != nil {
+				status, msg := mapDomainErr(err)
+				return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+			}
+			s.setPlaybackAutoPause(roomID, true)
+			s.setPlaybackPending(roomID, true)
+		} else if waitingToStart || s.isPlaybackPending(roomID) {
+			s.setPlaybackPending(roomID, true)
+		}
+		if waitingToStart {
+			s.clearPlaybackStartAt(roomID)
+		}
+	} else {
+		bufferingPlayers := s.bufferingPlayers(roomID, snap.Players)
+		if len(bufferingPlayers) == 0 && s.isPlaybackPending(roomID) && s.allPlayersReady(roomID, snap.Players) {
+			if err := s.nttRepo.TogglePauseSafe(ctx, roomID, snap.OwnerSub, false); err != nil {
+				status, msg := mapDomainErr(err)
+				return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+			}
+			s.setPlaybackAutoPause(roomID, false)
+			s.setPlaybackPending(roomID, false)
+			s.setPlaybackStartAt(roomID, time.Now().UTC().Add(playbackSyncLead))
+		}
+	}
+
+	snap, err = s.loadRoomSnapshot(ctx, roomID)
+	if err != nil {
+		status, msg := mapDomainErr(err)
+		return namethattune.RoomSnapshot{}, &apiError{Status: status, Message: msg}
+	}
+
+	s.broadcastSnapshot(ctx, roomID)
+	return snap, nil
+}
+
+func (s *Server) doBuzz(ctx context.Context, roomID, playerID string) error {
+	playerID = strings.TrimSpace(playerID)
+	if until, ok := s.buzzCooldownUntil(roomID, playerID); ok && until.After(time.Now().UTC()) {
+		return &apiError{Status: http.StatusBadRequest, Message: "buzz cooldown active"}
+	}
+
+	player, err := s.nttRepo.HandleBuzz(ctx, roomID, playerID)
+	if err != nil {
+		status, msg := mapDomainErr(err)
+		return &apiError{Status: status, Message: msg}
+	}
+
+	if s.rt != nil {
+		s.rt.Room(roomID).Broadcast(realtime.Event{
+			Type:   "buzzer",
+			RoomID: roomID,
+			Payload: map[string]any{
+				"player": player,
+			},
+		})
+	}
+
+	s.broadcastSnapshot(ctx, roomID)
+	return nil
+}
+
+func (s *Server) doBuzzResolve(ctx context.Context, roomID, sub, playerID string, correct bool) error {
+	playerID = strings.TrimSpace(playerID)
+	if playerID == "" {
+		return &apiError{Status: http.StatusBadRequest, Message: "invalid input"}
+	}
+
+	var cooldownUntil string
+	if correct {
+		s.clearBuzzCooldown(roomID, playerID)
+		if err := s.nttRepo.AddScore(ctx, roomID, sub, playerID, 1); err != nil {
+			status, msg := mapDomainErr(err)
+			return &apiError{Status: status, Message: msg}
+		}
+
+		snap, err := s.loadRoomSnapshot(ctx, roomID)
+		if err != nil {
+			status, msg := mapDomainErr(err)
+			return &apiError{Status: status, Message: msg}
+		}
+		if snap.Playlist != nil && len(snap.Playlist.Items) > 0 {
+			nextIndex := snap.Playback.TrackIndex + 1
+			max := (len(snap.Playlist.Items) - 1)
+			if nextIndex > max {
+				nextIndex = max
+			}
+			paused := true
+			position := 0
+			if err := s.nttRepo.SetPlayback(ctx, roomID, sub, nextIndex, &paused, &position); err != nil {
+				status, msg := mapDomainErr(err)
+				return &apiError{Status: status, Message: msg}
+			}
+			s.clearPlaybackState(roomID)
+		} else {
+			paused := true
+			if err := s.nttRepo.TogglePauseSafe(ctx, roomID, sub, paused); err != nil {
+				status, msg := mapDomainErr(err)
+				return &apiError{Status: status, Message: msg}
+			}
+			s.clearPlaybackStartAt(roomID)
+			s.setPlaybackPending(roomID, false)
+			s.setPlaybackAutoPause(roomID, false)
+		}
+	} else {
+		const cooldown = 5 * time.Second
+		until := time.Now().UTC().Add(cooldown)
+		s.setBuzzCooldown(roomID, playerID, until)
+		cooldownUntil = until.Format(time.RFC3339Nano)
+		paused := false
+		if err := s.nttRepo.TogglePauseSafe(ctx, roomID, sub, paused); err != nil {
+			status, msg := mapDomainErr(err)
+			return &apiError{Status: status, Message: msg}
+		}
+		if !paused {
+			s.setPlaybackStartAt(roomID, time.Now().UTC().Add(playbackSyncLead))
+			s.setPlaybackPending(roomID, false)
+			s.setPlaybackAutoPause(roomID, false)
+		}
+	}
+
+	if s.rt != nil {
+		s.rt.Room(roomID).Broadcast(realtime.Event{
+			Type:   "buzzer.resolved",
+			RoomID: roomID,
+			Payload: map[string]any{
+				"playerId": playerID,
+				"correct":  correct,
+			},
+		})
+		if !correct {
+			s.rt.Room(roomID).Broadcast(realtime.Event{
+				Type:   "buzzer.cooldown",
+				RoomID: roomID,
+				Payload: map[string]any{
+					"playerId": playerID,
+					"until":    cooldownUntil,
+				},
+			})
+		}
+	}
+
+	s.broadcastSnapshot(ctx, roomID)
+	return nil
+}
+
 func (s *Server) decorateSnapshot(roomID string, snap *namethattune.RoomSnapshot) {
 	if snap == nil {
 		return
 	}
-	if startAt, ok := s.playbackStartAt(roomID); ok {
+	if startAt, ok := s.getPlaybackStartAt(roomID); ok {
 		t := startAt
 		snap.Playback.StartAt = &t
 	}
@@ -687,501 +1022,6 @@ func (s *Server) handleLeaveRoom(w http.ResponseWriter, r *http.Request) {
 	if closedReason != "" {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "closed": true, "reason": closedReason})
 		return
-	}
-
-	s.broadcastSnapshot(r.Context(), roomID)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-}
-
-// =============================
-// REST handlers: Owner controls
-// =============================
-
-func (s *Server) handleKick(w http.ResponseWriter, r *http.Request) {
-	roomID := roomIDParam(r)
-
-	type reqBody struct {
-		PlayerID string `json:"playerId"`
-	}
-	var body reqBody
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-
-	if err := s.nttRepo.KickPlayer(r.Context(), roomID, userSub(r), strings.TrimSpace(body.PlayerID)); err != nil {
-		status, msg := mapDomainErr(err)
-		writeError(w, status, msg)
-		return
-	}
-
-	snap, err := s.loadRoomSnapshot(r.Context(), roomID)
-	if err != nil {
-		status, msg := mapDomainErr(err)
-		writeError(w, status, msg)
-		return
-	}
-
-	s.broadcastSnapshot(r.Context(), roomID)
-	writeJSON(w, http.StatusOK, snap)
-}
-
-func (s *Server) handleScoreSet(w http.ResponseWriter, r *http.Request) {
-	roomID := roomIDParam(r)
-
-	type reqBody struct {
-		PlayerID string `json:"playerId"`
-		Score    int    `json:"score"`
-	}
-	var body reqBody
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-
-	if err := s.nttRepo.SetScore(r.Context(), roomID, userSub(r), strings.TrimSpace(body.PlayerID), body.Score); err != nil {
-		status, msg := mapDomainErr(err)
-		writeError(w, status, msg)
-		return
-	}
-
-	snap, err := s.loadRoomSnapshot(r.Context(), roomID)
-	if err != nil {
-		status, msg := mapDomainErr(err)
-		writeError(w, status, msg)
-		return
-	}
-
-	s.broadcastSnapshot(r.Context(), roomID)
-	writeJSON(w, http.StatusOK, snap)
-}
-
-func (s *Server) handleScoreAdd(w http.ResponseWriter, r *http.Request) {
-	roomID := roomIDParam(r)
-
-	type reqBody struct {
-		PlayerID string `json:"playerId"`
-		Delta    int    `json:"delta"`
-	}
-	var body reqBody
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-
-	if err := s.nttRepo.AddScore(r.Context(), roomID, userSub(r), strings.TrimSpace(body.PlayerID), body.Delta); err != nil {
-		status, msg := mapDomainErr(err)
-		writeError(w, status, msg)
-		return
-	}
-
-	snap, err := s.loadRoomSnapshot(r.Context(), roomID)
-	if err != nil {
-		status, msg := mapDomainErr(err)
-		writeError(w, status, msg)
-		return
-	}
-
-	s.broadcastSnapshot(r.Context(), roomID)
-	writeJSON(w, http.StatusOK, snap)
-}
-
-func (s *Server) handleLoadPlaylist(w http.ResponseWriter, r *http.Request) {
-	roomID := roomIDParam(r)
-
-	type reqBody struct {
-		PlaylistID string `json:"playlistId"`
-	}
-	var body reqBody
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-
-	if err := s.nttRepo.LoadPlaylistToRoom(r.Context(), roomID, userSub(r), strings.TrimSpace(body.PlaylistID)); err != nil {
-		status, msg := mapDomainErr(err)
-		writeError(w, status, msg)
-		return
-	}
-
-	s.clearPlaybackState(roomID)
-	snap, err := s.loadRoomSnapshot(r.Context(), roomID)
-	if err != nil {
-		status, msg := mapDomainErr(err)
-		writeError(w, status, msg)
-		return
-	}
-
-	s.broadcastSnapshot(r.Context(), roomID)
-	writeJSON(w, http.StatusOK, snap)
-}
-
-func (s *Server) handlePlaybackSet(w http.ResponseWriter, r *http.Request) {
-	roomID := roomIDParam(r)
-
-	type reqBody struct {
-		TrackIndex int   `json:"trackIndex"`
-		Paused     *bool `json:"paused,omitempty"`
-		PositionMS *int  `json:"positionMs,omitempty"`
-	}
-	var body reqBody
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-
-	// track index is mandatory in this endpoint
-	if err := s.nttRepo.SetPlayback(r.Context(), roomID, userSub(r), body.TrackIndex, body.Paused, body.PositionMS); err != nil {
-		status, msg := mapDomainErr(err)
-		writeError(w, status, msg)
-		return
-	}
-
-	s.clearPlaybackState(roomID)
-	snap, err := s.loadRoomSnapshot(r.Context(), roomID)
-	if err != nil {
-		status, msg := mapDomainErr(err)
-		writeError(w, status, msg)
-		return
-	}
-
-	s.broadcastSnapshot(r.Context(), roomID)
-	writeJSON(w, http.StatusOK, snap)
-}
-
-func (s *Server) handlePlaybackPause(w http.ResponseWriter, r *http.Request) {
-	roomID := roomIDParam(r)
-
-	type reqBody struct {
-		Paused bool `json:"paused"`
-	}
-	var body reqBody
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-
-	if body.Paused {
-		if err := s.nttRepo.TogglePauseSafe(r.Context(), roomID, userSub(r), true); err != nil {
-			status, msg := mapDomainErr(err)
-			writeError(w, status, msg)
-			return
-		}
-		s.setPlaybackPending(roomID, false)
-		s.clearPlaybackStartAt(roomID)
-		s.setPlaybackAutoPause(roomID, false)
-
-		snap, err := s.loadRoomSnapshot(r.Context(), roomID)
-		if err != nil {
-			status, msg := mapDomainErr(err)
-			writeError(w, status, msg)
-			return
-		}
-
-		s.broadcastSnapshot(r.Context(), roomID)
-		writeJSON(w, http.StatusOK, snap)
-		return
-	}
-
-	snap, err := s.loadRoomSnapshot(r.Context(), roomID)
-	if err != nil {
-		status, msg := mapDomainErr(err)
-		writeError(w, status, msg)
-		return
-	}
-
-	if !s.allPlayersReady(roomID, snap.Players) {
-		s.setPlaybackPending(roomID, true)
-		s.clearPlaybackStartAt(roomID)
-		s.setPlaybackAutoPause(roomID, false)
-		s.decorateSnapshot(roomID, &snap)
-		s.broadcastSnapshot(r.Context(), roomID)
-		writeJSON(w, http.StatusOK, snap)
-		return
-	}
-
-	if err := s.nttRepo.TogglePauseSafe(r.Context(), roomID, userSub(r), false); err != nil {
-		status, msg := mapDomainErr(err)
-		writeError(w, status, msg)
-		return
-	}
-
-	startAt := time.Now().UTC().Add(playbackSyncLead)
-	s.setPlaybackStartAt(roomID, startAt)
-	s.setPlaybackPending(roomID, false)
-	s.setPlaybackAutoPause(roomID, false)
-
-	snap, err = s.loadRoomSnapshot(r.Context(), roomID)
-	if err != nil {
-		status, msg := mapDomainErr(err)
-		writeError(w, status, msg)
-		return
-	}
-
-	s.broadcastSnapshot(r.Context(), roomID)
-	writeJSON(w, http.StatusOK, snap)
-}
-
-func (s *Server) handlePlaybackSeek(w http.ResponseWriter, r *http.Request) {
-	roomID := roomIDParam(r)
-
-	type reqBody struct {
-		PositionMS int `json:"positionMs"`
-	}
-	var body reqBody
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-
-	if err := s.nttRepo.Seek(r.Context(), roomID, userSub(r), body.PositionMS); err != nil {
-		status, msg := mapDomainErr(err)
-		writeError(w, status, msg)
-		return
-	}
-
-	s.setPlaybackPending(roomID, false)
-	s.clearPlaybackStartAt(roomID)
-	snap, err := s.loadRoomSnapshot(r.Context(), roomID)
-	if err != nil {
-		status, msg := mapDomainErr(err)
-		writeError(w, status, msg)
-		return
-	}
-
-	s.broadcastSnapshot(r.Context(), roomID)
-	writeJSON(w, http.StatusOK, snap)
-}
-
-func (s *Server) handlePlaybackBuffering(w http.ResponseWriter, r *http.Request) {
-	roomID := roomIDParam(r)
-
-	type reqBody struct {
-		PlayerID  string `json:"playerId"`
-		Buffering bool   `json:"buffering"`
-	}
-	var body reqBody
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-
-	playerID := strings.TrimSpace(body.PlayerID)
-	if playerID == "" {
-		writeError(w, http.StatusBadRequest, "invalid input")
-		return
-	}
-
-	snap, err := s.loadRoomSnapshot(r.Context(), roomID)
-	if err != nil {
-		status, msg := mapDomainErr(err)
-		writeError(w, status, msg)
-		return
-	}
-
-	var player *namethattune.PlayerView
-	for i := range snap.Players {
-		if snap.Players[i].PlayerID == playerID {
-			player = &snap.Players[i]
-			break
-		}
-	}
-	if player == nil {
-		writeError(w, http.StatusNotFound, "player not found")
-		return
-	}
-	if !player.Connected {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-		return
-	}
-
-	s.setPlaybackBuffering(roomID, playerID, body.Buffering)
-	s.setPlaybackReady(roomID, playerID, !body.Buffering)
-
-	now := time.Now().UTC()
-	startAt := snap.Playback.StartAt
-	waitingToStart := startAt != nil && startAt.After(now)
-
-	if body.Buffering {
-		if !snap.Playback.Paused && !waitingToStart {
-			if err := s.nttRepo.PausePlaybackWithPosition(r.Context(), roomID); err != nil {
-				status, msg := mapDomainErr(err)
-				writeError(w, status, msg)
-				return
-			}
-			s.setPlaybackAutoPause(roomID, true)
-			s.setPlaybackPending(roomID, true)
-		} else if waitingToStart || s.isPlaybackPending(roomID) {
-			s.setPlaybackPending(roomID, true)
-		}
-		if waitingToStart {
-			s.clearPlaybackStartAt(roomID)
-		}
-	} else {
-		bufferingPlayers := s.bufferingPlayers(roomID, snap.Players)
-		if len(bufferingPlayers) == 0 && s.isPlaybackPending(roomID) && s.allPlayersReady(roomID, snap.Players) {
-			if err := s.nttRepo.TogglePauseSafe(r.Context(), roomID, snap.OwnerSub, false); err != nil {
-				status, msg := mapDomainErr(err)
-				writeError(w, status, msg)
-				return
-			}
-			s.setPlaybackAutoPause(roomID, false)
-			s.setPlaybackPending(roomID, false)
-			s.setPlaybackStartAt(roomID, time.Now().UTC().Add(playbackSyncLead))
-		}
-	}
-
-	snap, err = s.loadRoomSnapshot(r.Context(), roomID)
-	if err != nil {
-		status, msg := mapDomainErr(err)
-		writeError(w, status, msg)
-		return
-	}
-
-	s.broadcastSnapshot(r.Context(), roomID)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "snapshot": snap})
-}
-
-// =============================
-// REST handlers: Player actions
-// =============================
-
-func (s *Server) handleBuzz(w http.ResponseWriter, r *http.Request) {
-	roomID := roomIDParam(r)
-
-	type reqBody struct {
-		PlayerID string `json:"playerId"`
-	}
-	var body reqBody
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-
-	playerID := strings.TrimSpace(body.PlayerID)
-	if until, ok := s.buzzCooldownUntil(roomID, playerID); ok && until.After(time.Now().UTC()) {
-		writeError(w, http.StatusBadRequest, "buzz cooldown active")
-		return
-	}
-
-	player, err := s.nttRepo.HandleBuzz(r.Context(), roomID, playerID)
-	if err != nil {
-		status, msg := mapDomainErr(err)
-		writeError(w, status, msg)
-		return
-	}
-
-	if s.rt != nil {
-		s.rt.Room(roomID).Broadcast(realtime.Event{
-			Type:   "buzzer",
-			RoomID: roomID,
-			Payload: map[string]any{
-				"player": player,
-			},
-		})
-	}
-
-	s.broadcastSnapshot(r.Context(), roomID)
-
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-}
-
-func (s *Server) handleBuzzResolve(w http.ResponseWriter, r *http.Request) {
-	roomID := roomIDParam(r)
-
-	type reqBody struct {
-		PlayerID string `json:"playerId"`
-		Correct  bool   `json:"correct"`
-	}
-	var body reqBody
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-
-	playerID := strings.TrimSpace(body.PlayerID)
-	if playerID == "" {
-		writeError(w, http.StatusBadRequest, "invalid input")
-		return
-	}
-
-	var cooldownUntil string
-	if body.Correct {
-		s.clearBuzzCooldown(roomID, playerID)
-		if err := s.nttRepo.AddScore(r.Context(), roomID, userSub(r), playerID, 1); err != nil {
-			status, msg := mapDomainErr(err)
-			writeError(w, status, msg)
-			return
-		}
-
-		snap, err := s.loadRoomSnapshot(r.Context(), roomID)
-		if err != nil {
-			status, msg := mapDomainErr(err)
-			writeError(w, status, msg)
-			return
-		}
-		if snap.Playlist != nil && len(snap.Playlist.Items) > 0 {
-			nextIndex := snap.Playback.TrackIndex + 1
-			max := (len(snap.Playlist.Items) - 1)
-			if nextIndex > max {
-				nextIndex = max
-			}
-			paused := true
-			position := 0
-			if err := s.nttRepo.SetPlayback(r.Context(), roomID, userSub(r), nextIndex, &paused, &position); err != nil {
-				status, msg := mapDomainErr(err)
-				writeError(w, status, msg)
-				return
-			}
-			s.clearPlaybackState(roomID)
-		} else {
-			paused := true
-			if err := s.nttRepo.TogglePauseSafe(r.Context(), roomID, userSub(r), paused); err != nil {
-				status, msg := mapDomainErr(err)
-				writeError(w, status, msg)
-				return
-			}
-			s.clearPlaybackStartAt(roomID)
-			s.setPlaybackPending(roomID, false)
-			s.setPlaybackAutoPause(roomID, false)
-		}
-	} else {
-		const cooldown = 5 * time.Second
-		until := time.Now().UTC().Add(cooldown)
-		s.setBuzzCooldown(roomID, playerID, until)
-		cooldownUntil = until.Format(time.RFC3339Nano)
-		paused := false
-		if err := s.nttRepo.TogglePauseSafe(r.Context(), roomID, userSub(r), paused); err != nil {
-			status, msg := mapDomainErr(err)
-			writeError(w, status, msg)
-			return
-		}
-		if !paused {
-			s.setPlaybackStartAt(roomID, time.Now().UTC().Add(playbackSyncLead))
-			s.setPlaybackPending(roomID, false)
-			s.setPlaybackAutoPause(roomID, false)
-		}
-	}
-
-	if s.rt != nil {
-		s.rt.Room(roomID).Broadcast(realtime.Event{
-			Type:   "buzzer.resolved",
-			RoomID: roomID,
-			Payload: map[string]any{
-				"playerId": playerID,
-				"correct":  body.Correct,
-			},
-		})
-		if !body.Correct {
-			s.rt.Room(roomID).Broadcast(realtime.Event{
-				Type:   "buzzer.cooldown",
-				RoomID: roomID,
-				Payload: map[string]any{
-					"playerId": playerID,
-					"until":    cooldownUntil,
-				},
-			})
-		}
 	}
 
 	s.broadcastSnapshot(r.Context(), roomID)
@@ -1471,14 +1311,192 @@ func (s *Server) handleRoomWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reader: drain to detect close/pings.
+	type wsInbound struct {
+		Type    string          `json:"type"`
+		RoomID  string          `json:"roomId"`
+		Payload json.RawMessage `json:"payload"`
+	}
+	type wsCommandPayload struct {
+		Action     string `json:"action"`
+		Sub        string `json:"sub,omitempty"`
+		PlayerID   string `json:"playerId,omitempty"`
+		PlaylistID string `json:"playlistId,omitempty"`
+		TrackIndex *int   `json:"trackIndex,omitempty"`
+		Paused     *bool  `json:"paused,omitempty"`
+		PositionMS *int   `json:"positionMs,omitempty"`
+		Delta      *int   `json:"delta,omitempty"`
+		Score      *int   `json:"score,omitempty"`
+		Correct    *bool  `json:"correct,omitempty"`
+		Buffering  *bool  `json:"buffering,omitempty"`
+	}
+
+	sendDirect := make(chan realtime.Event, 16)
+	queueDirect := func(ev realtime.Event) {
+		select {
+		case sendDirect <- ev:
+		default:
+		}
+	}
+
+	// Reader: handle commands + drain to detect close/pings.
 	readDone := make(chan struct{})
 	go func() {
 		defer close(readDone)
 		for {
-			_, _, err := c.Read(r.Context())
+			_, data, err := c.Read(r.Context())
 			if err != nil {
 				return
+			}
+
+			var msg wsInbound
+			if err := json.Unmarshal(data, &msg); err != nil {
+				queueDirect(realtime.Event{
+					Type:   "room.command.error",
+					RoomID: roomID,
+					Payload: map[string]any{
+						"message": "invalid json",
+						"status":  http.StatusBadRequest,
+					},
+				})
+				continue
+			}
+			if msg.Type != "room.command" {
+				continue
+			}
+			if msg.RoomID != "" && msg.RoomID != roomID {
+				queueDirect(realtime.Event{
+					Type:   "room.command.error",
+					RoomID: roomID,
+					Payload: map[string]any{
+						"message": "roomId mismatch",
+						"status":  http.StatusBadRequest,
+					},
+				})
+				continue
+			}
+
+			var payload wsCommandPayload
+			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+				queueDirect(realtime.Event{
+					Type:   "room.command.error",
+					RoomID: roomID,
+					Payload: map[string]any{
+						"message": "invalid command payload",
+						"status":  http.StatusBadRequest,
+					},
+				})
+				continue
+			}
+			action := strings.TrimSpace(payload.Action)
+			if action == "" {
+				queueDirect(realtime.Event{
+					Type:   "room.command.error",
+					RoomID: roomID,
+					Payload: map[string]any{
+						"message": "missing action",
+						"status":  http.StatusBadRequest,
+					},
+				})
+				continue
+			}
+
+			var cmdErr error
+			switch action {
+			case "kick":
+				if payload.Sub == "" {
+					cmdErr = &apiError{Status: http.StatusUnauthorized, Message: "unauthorized"}
+					break
+				}
+				_, cmdErr = s.doKick(r.Context(), roomID, payload.Sub, payload.PlayerID)
+			case "score.add":
+				if payload.Sub == "" {
+					cmdErr = &apiError{Status: http.StatusUnauthorized, Message: "unauthorized"}
+					break
+				}
+				if payload.Delta == nil {
+					cmdErr = &apiError{Status: http.StatusBadRequest, Message: "invalid input"}
+					break
+				}
+				_, cmdErr = s.doScoreAdd(r.Context(), roomID, payload.Sub, payload.PlayerID, *payload.Delta)
+			case "score.set":
+				if payload.Sub == "" {
+					cmdErr = &apiError{Status: http.StatusUnauthorized, Message: "unauthorized"}
+					break
+				}
+				if payload.Score == nil {
+					cmdErr = &apiError{Status: http.StatusBadRequest, Message: "invalid input"}
+					break
+				}
+				_, cmdErr = s.doScoreSet(r.Context(), roomID, payload.Sub, payload.PlayerID, *payload.Score)
+			case "playlist.load":
+				if payload.Sub == "" {
+					cmdErr = &apiError{Status: http.StatusUnauthorized, Message: "unauthorized"}
+					break
+				}
+				_, cmdErr = s.doLoadPlaylist(r.Context(), roomID, payload.Sub, payload.PlaylistID)
+			case "playback.set":
+				if payload.Sub == "" {
+					cmdErr = &apiError{Status: http.StatusUnauthorized, Message: "unauthorized"}
+					break
+				}
+				if payload.TrackIndex == nil {
+					cmdErr = &apiError{Status: http.StatusBadRequest, Message: "invalid input"}
+					break
+				}
+				_, cmdErr = s.doPlaybackSet(r.Context(), roomID, payload.Sub, *payload.TrackIndex, payload.Paused, payload.PositionMS)
+			case "playback.pause":
+				if payload.Sub == "" {
+					cmdErr = &apiError{Status: http.StatusUnauthorized, Message: "unauthorized"}
+					break
+				}
+				if payload.Paused == nil {
+					cmdErr = &apiError{Status: http.StatusBadRequest, Message: "invalid input"}
+					break
+				}
+				_, cmdErr = s.doPlaybackPause(r.Context(), roomID, payload.Sub, *payload.Paused)
+			case "playback.seek":
+				if payload.Sub == "" {
+					cmdErr = &apiError{Status: http.StatusUnauthorized, Message: "unauthorized"}
+					break
+				}
+				if payload.PositionMS == nil {
+					cmdErr = &apiError{Status: http.StatusBadRequest, Message: "invalid input"}
+					break
+				}
+				_, cmdErr = s.doPlaybackSeek(r.Context(), roomID, payload.Sub, *payload.PositionMS)
+			case "playback.buffer":
+				if payload.Buffering == nil {
+					cmdErr = &apiError{Status: http.StatusBadRequest, Message: "invalid input"}
+					break
+				}
+				_, cmdErr = s.doPlaybackBuffering(r.Context(), roomID, payload.PlayerID, *payload.Buffering)
+			case "buzz":
+				cmdErr = s.doBuzz(r.Context(), roomID, payload.PlayerID)
+			case "buzz.resolve":
+				if payload.Sub == "" {
+					cmdErr = &apiError{Status: http.StatusUnauthorized, Message: "unauthorized"}
+					break
+				}
+				if payload.Correct == nil {
+					cmdErr = &apiError{Status: http.StatusBadRequest, Message: "invalid input"}
+					break
+				}
+				cmdErr = s.doBuzzResolve(r.Context(), roomID, payload.Sub, payload.PlayerID, *payload.Correct)
+			default:
+				cmdErr = &apiError{Status: http.StatusBadRequest, Message: "unknown action"}
+			}
+
+			if cmdErr != nil {
+				status, msg := mapAPIError(cmdErr)
+				queueDirect(realtime.Event{
+					Type:   "room.command.error",
+					RoomID: roomID,
+					Payload: map[string]any{
+						"action":  action,
+						"message": msg,
+						"status":  status,
+					},
+				})
 			}
 		}
 	}()
@@ -1491,6 +1509,16 @@ func (s *Server) handleRoomWS(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-readDone:
 			return
+		case ev, ok := <-sendDirect:
+			if !ok {
+				return
+			}
+			if ev.RoomID == "" {
+				ev.RoomID = roomID
+			}
+			if err := wsWriteJSON(r.Context(), c, ev); err != nil {
+				return
+			}
 		case ev, ok := <-events:
 			if !ok {
 				return

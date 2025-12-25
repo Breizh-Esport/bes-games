@@ -226,105 +226,6 @@ func TestRooms_CreateListJoinLeaveAndGetSnapshot(t *testing.T) {
 	}
 }
 
-func TestOwnerControls_ForbiddenForNonOwner(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	pool := freshDB(t, ctx)
-	srv := newTestServer(t, pool)
-	h := srv.Handler(Options{AllowedOrigins: []string{"http://localhost:5173"}})
-
-	roomID := createRoom(t, h, "owner-sub", "Room")
-	playerID := joinRoom(t, h, roomID, "", `{"nickname":"P1"}`)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/games/name-that-tune/rooms/"+roomID+"/kick", strings.NewReader(`{"playerId":"`+playerID+`"}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-User-Sub", "someone-else")
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("expected 403, got %d: %s", rr.Code, rr.Body.String())
-	}
-}
-
-func TestOwnerControls_ScoreAndKick(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	pool := freshDB(t, ctx)
-	srv := newTestServer(t, pool)
-	h := srv.Handler(Options{AllowedOrigins: []string{"http://localhost:5173"}})
-
-	roomID := createRoom(t, h, "owner-sub", "Room")
-	playerID := joinRoom(t, h, roomID, "", `{"nickname":"P1"}`)
-
-	// Add score +2
-	{
-		req := httptest.NewRequest(http.MethodPost, "/api/games/name-that-tune/rooms/"+roomID+"/score/add", strings.NewReader(`{"playerId":"`+playerID+`","delta":2}`))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-User-Sub", "owner-sub")
-		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, req)
-
-		if rr.Code != http.StatusOK {
-			t.Fatalf("score add: expected 200, got %d: %s", rr.Code, rr.Body.String())
-		}
-
-		var snap namethattune.RoomSnapshot
-		if err := json.Unmarshal(rr.Body.Bytes(), &snap); err != nil {
-			t.Fatalf("score add: unmarshal: %v", err)
-		}
-		p := findPlayer(t, snap, playerID)
-		if p.Score != 2 {
-			t.Fatalf("expected score 2, got %d", p.Score)
-		}
-	}
-
-	// Set score to 7
-	{
-		req := httptest.NewRequest(http.MethodPost, "/api/games/name-that-tune/rooms/"+roomID+"/score/set", strings.NewReader(`{"playerId":"`+playerID+`","score":7}`))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-User-Sub", "owner-sub")
-		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, req)
-
-		if rr.Code != http.StatusOK {
-			t.Fatalf("score set: expected 200, got %d: %s", rr.Code, rr.Body.String())
-		}
-
-		var snap namethattune.RoomSnapshot
-		if err := json.Unmarshal(rr.Body.Bytes(), &snap); err != nil {
-			t.Fatalf("score set: unmarshal: %v", err)
-		}
-		p := findPlayer(t, snap, playerID)
-		if p.Score != 7 {
-			t.Fatalf("expected score 7, got %d", p.Score)
-		}
-	}
-
-	// Kick player
-	{
-		req := httptest.NewRequest(http.MethodPost, "/api/games/name-that-tune/rooms/"+roomID+"/kick", strings.NewReader(`{"playerId":"`+playerID+`"}`))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-User-Sub", "owner-sub")
-		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, req)
-
-		if rr.Code != http.StatusOK {
-			t.Fatalf("kick: expected 200, got %d: %s", rr.Code, rr.Body.String())
-		}
-
-		var snap namethattune.RoomSnapshot
-		if err := json.Unmarshal(rr.Body.Bytes(), &snap); err != nil {
-			t.Fatalf("kick: unmarshal: %v", err)
-		}
-		if len(snap.Players) != 0 {
-			t.Fatalf("expected 0 players after kick, got %d", len(snap.Players))
-		}
-	}
-}
-
 func TestProfileAndPlaylists_CRUDAndRoomLoad(t *testing.T) {
 	t.Parallel()
 
@@ -441,36 +342,7 @@ func TestProfileAndPlaylists_CRUDAndRoomLoad(t *testing.T) {
 		}
 	}
 
-	// Create room and load playlist into room
-	roomID := createRoom(t, h, ownerSub, "Room")
-	{
-		req := httptest.NewRequest(http.MethodPost, "/api/games/name-that-tune/rooms/"+roomID+"/playlist/load", strings.NewReader(`{"playlistId":"`+playlistID+`"}`))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-User-Sub", ownerSub)
-		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, req)
-
-		if rr.Code != http.StatusOK {
-			t.Fatalf("load playlist: expected 200, got %d: %s", rr.Code, rr.Body.String())
-		}
-
-		var snap namethattune.RoomSnapshot
-		if err := json.Unmarshal(rr.Body.Bytes(), &snap); err != nil {
-			t.Fatalf("load playlist: unmarshal: %v", err)
-		}
-		if snap.Playlist == nil || snap.Playlist.PlaylistID != playlistID {
-			t.Fatalf("expected room to have loaded playlistId %q, got %#v", playlistID, snap.Playlist)
-		}
-		if snap.Playback.PlaylistID != playlistID {
-			t.Fatalf("expected playback playlistId %q, got %q", playlistID, snap.Playback.PlaylistID)
-		}
-		if !snap.Playback.Paused {
-			t.Fatalf("expected playback paused after load")
-		}
-		if len(snap.Playlist.Items) > 0 && snap.Playback.Track == nil {
-			t.Fatalf("expected playback track to be set when playlist has items")
-		}
-	}
+	_ = playlistID
 }
 
 func TestRoomWebSocket_ReceivesInitialSnapshot(t *testing.T) {

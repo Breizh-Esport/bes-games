@@ -485,11 +485,6 @@
                     <p class="muted">
                         Waiting for the host to validate the answer.
                     </p>
-                    <div class="actions">
-                        <button class="btn btn-ghost" @click="closeBuzzModal">
-                            Close
-                        </button>
-                    </div>
                 </template>
             </div>
         </div>
@@ -675,6 +670,7 @@ let nowTimer = null;
 let startTimer = null;
 let scheduledStartAt = null;
 let lastBufferingReport = null;
+let bufferingReportTimer = null;
 
 // Buzzer events
 const lastBuzz = ref(null);
@@ -682,6 +678,16 @@ const lastBuzz = ref(null);
 // WS
 const wsStatus = ref("disconnected");
 let ws = null;
+const ownerActions = new Set([
+    "kick",
+    "score.add",
+    "score.set",
+    "playlist.load",
+    "playback.set",
+    "playback.pause",
+    "playback.seek",
+    "buzz.resolve",
+]);
 
 const PLAYER_STORAGE_PREFIX = "ntt.player.";
 function storageKey() {
@@ -881,6 +887,7 @@ function syncPlayerFromSnapshot() {
         const match = snapshot.value.players.find((p) => p.sub === sub);
         if (match) {
             setPlayerId(match.playerId);
+            sendCurrentBufferState();
         }
     }
 }
@@ -975,6 +982,7 @@ async function setupYouTubePlayer() {
                 ytReady.value = true;
                 applyPlaybackQualityLow();
                 syncPlayerToSnapshot();
+                sendCurrentBufferState();
             },
             onStateChange: handleYTStateChange,
         },
@@ -992,6 +1000,10 @@ function destroyYouTubePlayer() {
     ytReady.value = false;
     currentVideoId.value = "";
     clearScheduledStart();
+    if (bufferingReportTimer) {
+        clearTimeout(bufferingReportTimer);
+        bufferingReportTimer = null;
+    }
 }
 
 function clearScheduledStart() {
@@ -1032,14 +1044,41 @@ function applyPlaybackQualityLow() {
     }
 }
 
+function getCurrentBufferingState() {
+    if (!ytPlayer.value?.getPlayerState || !window.YT?.PlayerState) return null;
+    const state = ytPlayer.value.getPlayerState();
+    if (state === window.YT.PlayerState.BUFFERING) return true;
+    if (
+        state === window.YT.PlayerState.CUED ||
+        state === window.YT.PlayerState.PLAYING ||
+        state === window.YT.PlayerState.PAUSED ||
+        state === window.YT.PlayerState.ENDED
+    ) {
+        return false;
+    }
+    return null;
+}
+
+function sendCurrentBufferState() {
+    const buffering = getCurrentBufferingState();
+    if (buffering === null) return;
+    reportPlaybackBuffering(buffering);
+}
+
 function reportPlaybackBuffering(buffering) {
-    if (!currentPlayerConnected.value || !playerId.value) return;
+    if (!currentPlayerConnected.value) return;
+    const resolvedPlayerId = playerId.value || currentPlayer.value?.playerId;
+    if (!resolvedPlayerId) return;
     if (lastBufferingReport === buffering) return;
-    lastBufferingReport = buffering;
-    api.reportPlaybackBuffering(props.gameId, props.roomId, {
-        playerId: playerId.value,
+    const sent = sendRoomCommand("playback.buffer", {
+        playerId: resolvedPlayerId,
         buffering,
-    }).catch(() => {});
+    });
+    if (!sent) return;
+    lastBufferingReport = buffering;
+    if (!playerId.value) {
+        setPlayerId(resolvedPlayerId);
+    }
 }
 
 function handleYTStateChange(evt) {
@@ -1047,11 +1086,24 @@ function handleYTStateChange(evt) {
     const YT = window.YT;
     if (!YT?.PlayerState) return;
     if (state === YT.PlayerState.BUFFERING) {
-        reportPlaybackBuffering(true);
+        if (bufferingReportTimer) return;
+        bufferingReportTimer = setTimeout(() => {
+            bufferingReportTimer = null;
+            sendCurrentBufferState();
+        }, 300);
         return;
     }
-    if (state === YT.PlayerState.CUED || state === YT.PlayerState.PLAYING) {
-        reportPlaybackBuffering(false);
+    if (bufferingReportTimer) {
+        clearTimeout(bufferingReportTimer);
+        bufferingReportTimer = null;
+    }
+    if (
+        state === YT.PlayerState.CUED ||
+        state === YT.PlayerState.PLAYING ||
+        state === YT.PlayerState.PAUSED ||
+        state === YT.PlayerState.ENDED
+    ) {
+        sendCurrentBufferState();
     }
 }
 
@@ -1168,9 +1220,11 @@ async function loadSelectedPlaylist() {
     busyOwner.value = true;
     ownerError.value = "";
     try {
-        await api.loadPlaylist(props.gameId, props.roomId, {
+        const sent = sendRoomCommand("playlist.load", {
             playlistId: selectedPlaylistId.value,
+            sub: auth.state.sub || "",
         });
+        if (!sent) throw new Error("Realtime connection required.");
         // Do not apply REST response to local room state.
         // Room state (playlist, playback, players, scores) is driven by WebSocket snapshots.
     } catch (e) {
@@ -1185,7 +1239,11 @@ async function togglePause() {
     ownerError.value = "";
     try {
         const paused = !snapshot.value?.playback?.paused;
-        await api.pause(props.gameId, props.roomId, { paused });
+        const sent = sendRoomCommand("playback.pause", {
+            paused,
+            sub: auth.state.sub || "",
+        });
+        if (!sent) throw new Error("Realtime connection required.");
         // Do not apply REST response; wait for WS `room.snapshot`.
     } catch (e) {
         ownerError.value = e?.message || "Failed to toggle pause";
@@ -1201,11 +1259,13 @@ async function setTrackIndex(
     busyOwner.value = true;
     ownerError.value = "";
     try {
-        await api.setPlayback(props.gameId, props.roomId, {
+        const sent = sendRoomCommand("playback.set", {
             trackIndex,
             paused,
             positionMs,
+            sub: auth.state.sub || "",
         });
+        if (!sent) throw new Error("Realtime connection required.");
         // Do not apply REST response; wait for WS `room.snapshot`.
     } catch (e) {
         ownerError.value = e?.message || "Failed to set playback";
@@ -1237,9 +1297,11 @@ async function seekToMs(positionMs) {
     busyOwner.value = true;
     ownerError.value = "";
     try {
-        await api.seek(props.gameId, props.roomId, {
+        const sent = sendRoomCommand("playback.seek", {
             positionMs: Math.floor(positionMs),
+            sub: auth.state.sub || "",
         });
+        if (!sent) throw new Error("Realtime connection required.");
         // Do not apply REST response; wait for WS `room.snapshot`.
     } catch (e) {
         ownerError.value = e?.message || "Failed to seek";
@@ -1262,7 +1324,11 @@ async function kick(pid) {
     busyOwner.value = true;
     ownerError.value = "";
     try {
-        await api.kick(props.gameId, props.roomId, { playerId: pid });
+        const sent = sendRoomCommand("kick", {
+            playerId: pid,
+            sub: auth.state.sub || "",
+        });
+        if (!sent) throw new Error("Realtime connection required.");
         // Do not apply REST response; roster updates come via WS `room.snapshot`.
     } catch (e) {
         ownerError.value = e?.message || "Failed to kick player";
@@ -1275,10 +1341,12 @@ async function scoreDelta(pid, delta) {
     busyOwner.value = true;
     ownerError.value = "";
     try {
-        await api.addScore(props.gameId, props.roomId, {
+        const sent = sendRoomCommand("score.add", {
             playerId: pid,
             delta,
+            sub: auth.state.sub || "",
         });
+        if (!sent) throw new Error("Realtime connection required.");
         // Do not apply REST response; score updates come via WS `room.snapshot`.
     } catch (e) {
         ownerError.value = e?.message || "Failed to update score";
@@ -1295,10 +1363,12 @@ async function scoreSetPrompt(pid, current) {
     busyOwner.value = true;
     ownerError.value = "";
     try {
-        await api.setScore(props.gameId, props.roomId, {
+        const sent = sendRoomCommand("score.set", {
             playerId: pid,
             score: Math.trunc(n),
+            sub: auth.state.sub || "",
         });
+        if (!sent) throw new Error("Realtime connection required.");
         // Do not apply REST response; score updates come via WS `room.snapshot`.
     } catch (e) {
         ownerError.value = e?.message || "Failed to set score";
@@ -1400,9 +1470,10 @@ async function buzz() {
     buzzing.value = true;
     playerError.value = "";
     try {
-        await api.buzz(props.gameId, props.roomId, {
+        const sent = sendRoomCommand("buzz", {
             playerId: playerId.value,
         });
+        if (!sent) throw new Error("Realtime connection required.");
     } catch (e) {
         playerError.value = e?.message || "Failed to buzz";
     } finally {
@@ -1410,19 +1481,17 @@ async function buzz() {
     }
 }
 
-function closeBuzzModal() {
-    buzzModal.value = null;
-}
-
 async function resolveBuzz(correct) {
     if (!buzzModal.value?.playerId) return;
     resolvingBuzz.value = true;
     ownerError.value = "";
     try {
-        await api.resolveBuzz(props.gameId, props.roomId, {
+        const sent = sendRoomCommand("buzz.resolve", {
             playerId: buzzModal.value.playerId,
             correct,
+            sub: auth.state.sub || "",
         });
+        if (!sent) throw new Error("Realtime connection required.");
         buzzModal.value = null;
     } catch (e) {
         ownerError.value = e?.message || "Failed to resolve buzz";
@@ -1432,6 +1501,22 @@ async function resolveBuzz(correct) {
 }
 
 // WS connection
+function sendRoomCommand(action, payload) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    try {
+        ws.send(
+            JSON.stringify({
+                type: "room.command",
+                roomId: props.roomId,
+                payload: { action, ...payload },
+            }),
+        );
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 function connectWS() {
     disconnectWS();
 
@@ -1442,6 +1527,7 @@ function connectWS() {
 
     ws.onopen = () => {
         wsStatus.value = "connected";
+        sendCurrentBufferState();
     };
 
     ws.onclose = () => {
@@ -1474,6 +1560,18 @@ function connectWS() {
                         },
                     );
                     cooldownByPlayer.value = next;
+                }
+                return;
+            }
+
+            if (msg?.type === "room.command.error") {
+                const action = msg?.payload?.action || "";
+                const message =
+                    msg?.payload?.message || "Command failed. Try again.";
+                if (ownerActions.has(action)) {
+                    ownerError.value = message;
+                } else {
+                    playerError.value = message;
                 }
                 return;
             }
@@ -1599,6 +1697,7 @@ onMounted(async () => {
     connectWS();
     syncTimer = setInterval(() => {
         syncPlayerToSnapshot();
+        sendCurrentBufferState();
     }, 1000);
 });
 
