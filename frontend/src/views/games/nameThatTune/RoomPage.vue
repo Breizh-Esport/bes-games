@@ -512,32 +512,39 @@
                         </div>
                     </template>
                     <template v-else>
-                        <p class="muted">Enter a nickname to join this room.</p>
+                        <p class="muted" v-if="canSkipNickname">
+                            Enter the room password to reconnect.
+                        </p>
+                        <p class="muted" v-else>
+                            Enter a nickname to join this room.
+                        </p>
                         <div class="row">
-                            <div class="col">
-                                <label class="label" for="modalNick"
-                                    >Nickname</label
-                                >
-                                <input
-                                    id="modalNick"
-                                    v-model="joinNick"
-                                    class="input"
-                                    type="text"
-                                    placeholder="Anonymous"
-                                />
-                            </div>
-                            <div class="col">
-                                <label class="label" for="modalPic"
-                                    >Picture URL</label
-                                >
-                                <input
-                                    id="modalPic"
-                                    v-model="joinPic"
-                                    class="input"
-                                    type="url"
-                                    placeholder="https://..."
-                                />
-                            </div>
+                            <template v-if="!canSkipNickname">
+                                <div class="col">
+                                    <label class="label" for="modalNick"
+                                        >Nickname</label
+                                    >
+                                    <input
+                                        id="modalNick"
+                                        v-model="joinNick"
+                                        class="input"
+                                        type="text"
+                                        placeholder="Anonymous"
+                                    />
+                                </div>
+                                <div class="col">
+                                    <label class="label" for="modalPic"
+                                        >Picture URL</label
+                                    >
+                                    <input
+                                        id="modalPic"
+                                        v-model="joinPic"
+                                        class="input"
+                                        type="url"
+                                        placeholder="https://..."
+                                    />
+                                </div>
+                            </template>
                             <div class="col" v-if="requiresRoomPassword">
                                 <label class="label" for="modalPassword"
                                     >Room password</label
@@ -557,7 +564,8 @@
                                     @click="joinFromModal"
                                     :disabled="
                                         joining ||
-                                        !joinNickTrimmed ||
+                                        (!canSkipNickname &&
+                                            !joinNickTrimmed) ||
                                         (requiresRoomPassword && !joinPassword)
                                     "
                                 >
@@ -763,6 +771,9 @@ const isOwner = computed(() => {
     if (!sub || !ownerSub) return false;
     return sub === ownerSub;
 });
+const canSkipNickname = computed(
+    () => auth.isAuthenticated.value && isOwner.value,
+);
 
 const currentPlayer = computed(() => {
     if (!snapshot.value?.players) return null;
@@ -826,6 +837,7 @@ const showJoinModal = computed(() => {
     if (!snapshot.value) return false;
     if (wasKicked.value) return true;
     if (currentPlayerConnected.value) return false;
+    if (canSkipNickname.value) return requiresRoomPassword.value;
     if (requiresRoomPassword.value) return true;
     return !hasStoredNickname.value;
 });
@@ -1419,12 +1431,12 @@ async function joinRoomWithProfile({
 
 async function joinFromModal() {
     const nickname = joinNickTrimmed.value;
-    if (!nickname) return;
+    if (!canSkipNickname.value && !nickname) return;
     await joinRoomWithProfile({
-        nickname,
-        pictureUrl: joinPic.value,
+        nickname: canSkipNickname.value ? "" : nickname,
+        pictureUrl: canSkipNickname.value ? "" : joinPic.value,
         password: joinPassword.value,
-        persist: true,
+        persist: !canSkipNickname.value,
     });
 }
 
@@ -1433,8 +1445,16 @@ async function maybeAutoJoin() {
     if (roomClosedReason.value) return;
     if (currentPlayerConnected.value) return;
     if (requiresRoomPassword.value) return;
-    if (!hasStoredNickname.value) return;
     if (joining.value) return;
+    if (canSkipNickname.value) {
+        await joinRoomWithProfile({
+            nickname: "",
+            pictureUrl: "",
+            persist: false,
+        });
+        return;
+    }
+    if (!hasStoredNickname.value) return;
     await joinRoomWithProfile({
         nickname: storedNickname.value,
         pictureUrl: storedPictureUrl.value,

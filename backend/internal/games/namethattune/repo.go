@@ -795,7 +795,9 @@ func (r *Repo) JoinRoom(ctx context.Context, roomID, userSub, nickname, pictureU
 			}
 			return JoinResult{}, fmt.Errorf("join room load: %w", err)
 		}
-		if passwordHash != "" && hashRoomPassword(password) != passwordHash {
+		if userSub != "" && userSub == ownerSub {
+			// Owner can always rejoin their own room without a password.
+		} else if passwordHash != "" && hashRoomPassword(password) != passwordHash {
 			return JoinResult{}, fmt.Errorf("%w: invalid room password", core.ErrUnauthorized)
 		}
 	}
