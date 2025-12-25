@@ -256,11 +256,12 @@
                         v-for="(track, index) in snapshot.playlist.items"
                         :key="track.id"
                         class="playlist-track"
-                        :class="
-                            index === snapshot.playback?.trackIndex
-                                ? 'is-current'
-                                : ''
-                        "
+                        :class="{
+                            'is-current':
+                                index === snapshot.playback?.trackIndex,
+                            'is-selectable': true,
+                        }"
+                        @click="selectTrack(index)"
                     >
                         <div class="playlist-track-thumb">
                             <img
@@ -681,6 +682,8 @@ let scheduledStartAt = null;
 let lastBufferingReport = null;
 let lastPlaybackStamp = "";
 let lastPlaybackPaused = null;
+let preloadReadyTimer = null;
+const PRELOAD_READY_FRACTION = 0.08;
 
 // Buzzer events
 const lastBuzz = ref(null);
@@ -1074,6 +1077,25 @@ function clearScheduledStart() {
     scheduledStartAt = null;
 }
 
+function startPreloadReadyPolling() {
+    if (preloadReadyTimer) {
+        clearTimeout(preloadReadyTimer);
+    }
+    preloadReadyTimer = setTimeout(() => {
+        if (!ytReady.value || !ytPlayer.value) return;
+        const fraction =
+            typeof ytPlayer.value.getVideoLoadedFraction === "function"
+                ? ytPlayer.value.getVideoLoadedFraction()
+                : 0;
+        if (Number.isFinite(fraction) && fraction >= PRELOAD_READY_FRACTION) {
+            reportPlaybackBuffering(false);
+            preloadReadyTimer = null;
+            return;
+        }
+        startPreloadReadyPolling();
+    }, 250);
+}
+
 function scheduleStart(startAtMs, targetSec) {
     if (!Number.isFinite(startAtMs)) return;
     if (scheduledStartAt === startAtMs) return;
@@ -1193,6 +1215,7 @@ function syncPlayerToSnapshot() {
             }
         }
         updatePlayerDuration();
+        startPreloadReadyPolling();
         const state = ytPlayer.value.getPlayerState
             ? ytPlayer.value.getPlayerState()
             : null;
@@ -1218,6 +1241,7 @@ function syncPlayerToSnapshot() {
         if (state !== window.YT?.PlayerState?.PAUSED) {
             ytPlayer.value.pauseVideo();
         }
+        startPreloadReadyPolling();
         if (ytPlayer.value.setPlaybackRate) {
             ytPlayer.value.setPlaybackRate(1);
         }
@@ -1226,6 +1250,7 @@ function syncPlayerToSnapshot() {
             ytPlayer.value.pauseVideo();
         }
         scheduleStart(desired.startAtMs, targetSec);
+        startPreloadReadyPolling();
         if (ytPlayer.value.setPlaybackRate) {
             ytPlayer.value.setPlaybackRate(1);
         }
@@ -1353,6 +1378,11 @@ function nextTrack() {
 function restartTrack() {
     const idx = snapshot.value?.playback?.trackIndex ?? 0;
     setTrackIndex(idx, { positionMs: 0 });
+}
+
+function selectTrack(index) {
+    if (busyOwner.value || !canControlPlayback.value) return;
+    setTrackIndex(index, { paused: true, positionMs: 0 });
 }
 
 async function seekToMs(positionMs) {
@@ -1916,6 +1946,7 @@ onBeforeUnmount(() => {
     if (syncTimer) clearInterval(syncTimer);
     if (nowTimer) clearInterval(nowTimer);
     clearScheduledStart();
+    if (preloadReadyTimer) clearTimeout(preloadReadyTimer);
 });
 </script>
 
@@ -2238,6 +2269,10 @@ onBeforeUnmount(() => {
     border-radius: 12px;
     border: 1px solid rgba(255, 255, 255, 0.08);
     background: rgba(255, 255, 255, 0.02);
+}
+
+.playlist-track.is-selectable {
+    cursor: pointer;
 }
 
 .playlist-track.is-current {
