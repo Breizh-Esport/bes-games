@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,6 +72,9 @@ type Server struct {
 	rooms    *roomLifecycle
 	buzzMu   sync.Mutex
 	buzzCD   map[string]map[string]time.Time
+	tokenMu      sync.Mutex
+	playerTokens map[string]map[string]string
+	ownerTokens  map[string]string
 	playbackMu        sync.Mutex
 	playbackBuffering map[string]map[string]bool
 	playbackReady     map[string]map[string]bool
@@ -102,6 +107,8 @@ func NewServer(coreRepo *core.Repo, nttRepo *namethattune.Repo, rt *realtime.Reg
 		rt:       rt,
 		rooms:    newRoomLifecycle(nttRepo, rt),
 		buzzCD:   make(map[string]map[string]time.Time),
+		playerTokens: make(map[string]map[string]string),
+		ownerTokens:  make(map[string]string),
 		playbackBuffering: make(map[string]map[string]bool),
 		playbackReady:     make(map[string]map[string]bool),
 		playbackPending:   make(map[string]bool),
@@ -244,6 +251,76 @@ func mapAPIError(err error) (int, string) {
 		return apiErr.Status, apiErr.Message
 	}
 	return http.StatusInternalServerError, "internal server error"
+}
+
+func randomToken() string {
+	buf := make([]byte, 24)
+	if _, err := rand.Read(buf); err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(buf)
+}
+
+func (s *Server) getOrCreatePlayerToken(roomID, playerID string) string {
+	s.tokenMu.Lock()
+	defer s.tokenMu.Unlock()
+	room := s.playerTokens[roomID]
+	if room == nil {
+		room = make(map[string]string)
+		s.playerTokens[roomID] = room
+	}
+	if token, ok := room[playerID]; ok {
+		return token
+	}
+	token := randomToken()
+	room[playerID] = token
+	return token
+}
+
+func (s *Server) clearPlayerToken(roomID, playerID string) {
+	s.tokenMu.Lock()
+	defer s.tokenMu.Unlock()
+	room := s.playerTokens[roomID]
+	if room == nil {
+		return
+	}
+	delete(room, playerID)
+	if len(room) == 0 {
+		delete(s.playerTokens, roomID)
+	}
+}
+
+func (s *Server) validatePlayerToken(roomID, playerID, token string) bool {
+	if token == "" {
+		return false
+	}
+	s.tokenMu.Lock()
+	defer s.tokenMu.Unlock()
+	room := s.playerTokens[roomID]
+	if room == nil {
+		return false
+	}
+	return room[playerID] == token
+}
+
+func (s *Server) getOrCreateOwnerToken(roomID string) string {
+	s.tokenMu.Lock()
+	defer s.tokenMu.Unlock()
+	if token, ok := s.ownerTokens[roomID]; ok {
+		return token
+	}
+	token := randomToken()
+	s.ownerTokens[roomID] = token
+	return token
+}
+
+func (s *Server) validateOwnerToken(roomID, token string) bool {
+	if token == "" {
+		return false
+	}
+	s.tokenMu.Lock()
+	defer s.tokenMu.Unlock()
+	return s.ownerTokens[roomID] == token
 }
 
 func (s *Server) buzzCooldownUntil(roomID, playerID string) (time.Time, bool) {
@@ -979,8 +1056,16 @@ func (s *Server) handleJoinRoom(w http.ResponseWriter, r *http.Request) {
 	// Broadcast snapshot for all listeners.
 	s.broadcastSnapshot(r.Context(), roomID)
 
+	playerToken := s.getOrCreatePlayerToken(roomID, joinRes.PlayerID)
+	ownerToken := ""
+	if joinRes.IsOwner {
+		ownerToken = s.getOrCreateOwnerToken(roomID)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"playerId": joinRes.PlayerID,
+		"playerToken": playerToken,
+		"ownerToken":  ownerToken,
 		"owner": map[string]any{
 			"playerId": joinRes.OwnerPlayerID,
 			"online":   joinRes.OwnerConnected,
@@ -1007,6 +1092,7 @@ func (s *Server) handleLeaveRoom(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, msg)
 		return
 	}
+	s.clearPlayerToken(roomID, strings.TrimSpace(body.PlayerID))
 
 	closedReason := ""
 	if leaveRes.OwnerLeft && leaveRes.ConnectedAfter == 0 {
@@ -1318,7 +1404,8 @@ func (s *Server) handleRoomWS(w http.ResponseWriter, r *http.Request) {
 	}
 	type wsCommandPayload struct {
 		Action     string `json:"action"`
-		Sub        string `json:"sub,omitempty"`
+		OwnerToken string `json:"ownerToken,omitempty"`
+		PlayerToken string `json:"playerToken,omitempty"`
 		PlayerID   string `json:"playerId,omitempty"`
 		PlaylistID string `json:"playlistId,omitempty"`
 		TrackIndex *int   `json:"trackIndex,omitempty"`
@@ -1401,15 +1488,36 @@ func (s *Server) handleRoomWS(w http.ResponseWriter, r *http.Request) {
 			}
 
 			var cmdErr error
+			var ownerSub string
+			ownerSubForRoom := func() (string, error) {
+				if ownerSub != "" {
+					return ownerSub, nil
+				}
+				snap, err := s.loadRoomSnapshot(r.Context(), roomID)
+				if err != nil {
+					status, msg := mapDomainErr(err)
+					return "", &apiError{Status: status, Message: msg}
+				}
+				if snap.OwnerSub == "" {
+					return "", &apiError{Status: http.StatusForbidden, Message: "forbidden"}
+				}
+				ownerSub = snap.OwnerSub
+				return ownerSub, nil
+			}
 			switch action {
 			case "kick":
-				if payload.Sub == "" {
+				if !s.validateOwnerToken(roomID, payload.OwnerToken) {
 					cmdErr = &apiError{Status: http.StatusUnauthorized, Message: "unauthorized"}
 					break
 				}
-				_, cmdErr = s.doKick(r.Context(), roomID, payload.Sub, payload.PlayerID)
+				sub, err := ownerSubForRoom()
+				if err != nil {
+					cmdErr = err
+					break
+				}
+				_, cmdErr = s.doKick(r.Context(), roomID, sub, payload.PlayerID)
 			case "score.add":
-				if payload.Sub == "" {
+				if !s.validateOwnerToken(roomID, payload.OwnerToken) {
 					cmdErr = &apiError{Status: http.StatusUnauthorized, Message: "unauthorized"}
 					break
 				}
@@ -1417,9 +1525,14 @@ func (s *Server) handleRoomWS(w http.ResponseWriter, r *http.Request) {
 					cmdErr = &apiError{Status: http.StatusBadRequest, Message: "invalid input"}
 					break
 				}
-				_, cmdErr = s.doScoreAdd(r.Context(), roomID, payload.Sub, payload.PlayerID, *payload.Delta)
+				sub, err := ownerSubForRoom()
+				if err != nil {
+					cmdErr = err
+					break
+				}
+				_, cmdErr = s.doScoreAdd(r.Context(), roomID, sub, payload.PlayerID, *payload.Delta)
 			case "score.set":
-				if payload.Sub == "" {
+				if !s.validateOwnerToken(roomID, payload.OwnerToken) {
 					cmdErr = &apiError{Status: http.StatusUnauthorized, Message: "unauthorized"}
 					break
 				}
@@ -1427,15 +1540,25 @@ func (s *Server) handleRoomWS(w http.ResponseWriter, r *http.Request) {
 					cmdErr = &apiError{Status: http.StatusBadRequest, Message: "invalid input"}
 					break
 				}
-				_, cmdErr = s.doScoreSet(r.Context(), roomID, payload.Sub, payload.PlayerID, *payload.Score)
+				sub, err := ownerSubForRoom()
+				if err != nil {
+					cmdErr = err
+					break
+				}
+				_, cmdErr = s.doScoreSet(r.Context(), roomID, sub, payload.PlayerID, *payload.Score)
 			case "playlist.load":
-				if payload.Sub == "" {
+				if !s.validateOwnerToken(roomID, payload.OwnerToken) {
 					cmdErr = &apiError{Status: http.StatusUnauthorized, Message: "unauthorized"}
 					break
 				}
-				_, cmdErr = s.doLoadPlaylist(r.Context(), roomID, payload.Sub, payload.PlaylistID)
+				sub, err := ownerSubForRoom()
+				if err != nil {
+					cmdErr = err
+					break
+				}
+				_, cmdErr = s.doLoadPlaylist(r.Context(), roomID, sub, payload.PlaylistID)
 			case "playback.set":
-				if payload.Sub == "" {
+				if !s.validateOwnerToken(roomID, payload.OwnerToken) {
 					cmdErr = &apiError{Status: http.StatusUnauthorized, Message: "unauthorized"}
 					break
 				}
@@ -1443,9 +1566,14 @@ func (s *Server) handleRoomWS(w http.ResponseWriter, r *http.Request) {
 					cmdErr = &apiError{Status: http.StatusBadRequest, Message: "invalid input"}
 					break
 				}
-				_, cmdErr = s.doPlaybackSet(r.Context(), roomID, payload.Sub, *payload.TrackIndex, payload.Paused, payload.PositionMS)
+				sub, err := ownerSubForRoom()
+				if err != nil {
+					cmdErr = err
+					break
+				}
+				_, cmdErr = s.doPlaybackSet(r.Context(), roomID, sub, *payload.TrackIndex, payload.Paused, payload.PositionMS)
 			case "playback.pause":
-				if payload.Sub == "" {
+				if !s.validateOwnerToken(roomID, payload.OwnerToken) {
 					cmdErr = &apiError{Status: http.StatusUnauthorized, Message: "unauthorized"}
 					break
 				}
@@ -1453,9 +1581,14 @@ func (s *Server) handleRoomWS(w http.ResponseWriter, r *http.Request) {
 					cmdErr = &apiError{Status: http.StatusBadRequest, Message: "invalid input"}
 					break
 				}
-				_, cmdErr = s.doPlaybackPause(r.Context(), roomID, payload.Sub, *payload.Paused)
+				sub, err := ownerSubForRoom()
+				if err != nil {
+					cmdErr = err
+					break
+				}
+				_, cmdErr = s.doPlaybackPause(r.Context(), roomID, sub, *payload.Paused)
 			case "playback.seek":
-				if payload.Sub == "" {
+				if !s.validateOwnerToken(roomID, payload.OwnerToken) {
 					cmdErr = &apiError{Status: http.StatusUnauthorized, Message: "unauthorized"}
 					break
 				}
@@ -1463,17 +1596,30 @@ func (s *Server) handleRoomWS(w http.ResponseWriter, r *http.Request) {
 					cmdErr = &apiError{Status: http.StatusBadRequest, Message: "invalid input"}
 					break
 				}
-				_, cmdErr = s.doPlaybackSeek(r.Context(), roomID, payload.Sub, *payload.PositionMS)
+				sub, err := ownerSubForRoom()
+				if err != nil {
+					cmdErr = err
+					break
+				}
+				_, cmdErr = s.doPlaybackSeek(r.Context(), roomID, sub, *payload.PositionMS)
 			case "playback.buffer":
 				if payload.Buffering == nil {
 					cmdErr = &apiError{Status: http.StatusBadRequest, Message: "invalid input"}
 					break
 				}
+				if payload.PlayerID == "" || !s.validatePlayerToken(roomID, payload.PlayerID, payload.PlayerToken) {
+					cmdErr = &apiError{Status: http.StatusUnauthorized, Message: "unauthorized"}
+					break
+				}
 				_, cmdErr = s.doPlaybackBuffering(r.Context(), roomID, payload.PlayerID, *payload.Buffering)
 			case "buzz":
+				if payload.PlayerID == "" || !s.validatePlayerToken(roomID, payload.PlayerID, payload.PlayerToken) {
+					cmdErr = &apiError{Status: http.StatusUnauthorized, Message: "unauthorized"}
+					break
+				}
 				cmdErr = s.doBuzz(r.Context(), roomID, payload.PlayerID)
 			case "buzz.resolve":
-				if payload.Sub == "" {
+				if !s.validateOwnerToken(roomID, payload.OwnerToken) {
 					cmdErr = &apiError{Status: http.StatusUnauthorized, Message: "unauthorized"}
 					break
 				}
@@ -1481,7 +1627,12 @@ func (s *Server) handleRoomWS(w http.ResponseWriter, r *http.Request) {
 					cmdErr = &apiError{Status: http.StatusBadRequest, Message: "invalid input"}
 					break
 				}
-				cmdErr = s.doBuzzResolve(r.Context(), roomID, payload.Sub, payload.PlayerID, *payload.Correct)
+				sub, err := ownerSubForRoom()
+				if err != nil {
+					cmdErr = err
+					break
+				}
+				cmdErr = s.doBuzzResolve(r.Context(), roomID, sub, payload.PlayerID, *payload.Correct)
 			default:
 				cmdErr = &apiError{Status: http.StatusBadRequest, Message: "unknown action"}
 			}

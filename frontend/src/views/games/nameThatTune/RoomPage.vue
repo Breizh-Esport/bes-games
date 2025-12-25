@@ -4,9 +4,9 @@
             <div class="brand">
                 <div class="row row-center row-gap-sm">
                     <RouterLink class="btn btn-ghost" to="/">Home</RouterLink>
-                    <RouterLink class="btn btn-ghost" to="/profile"
-                        >Profile</RouterLink
-                    >
+                    <RouterLink class="btn btn-ghost" to="/profile">
+                        Profile
+                    </RouterLink>
                 </div>
 
                 <h1 class="title">
@@ -678,13 +678,13 @@ let nowTimer = null;
 let startTimer = null;
 let scheduledStartAt = null;
 let lastBufferingReport = null;
-let bufferingReportTimer = null;
 
 // Buzzer events
 const lastBuzz = ref(null);
 
 // WS
 const wsStatus = ref("disconnected");
+const lastRealtimeError = ref("");
 let ws = null;
 const ownerActions = new Set([
     "kick",
@@ -696,10 +696,16 @@ const ownerActions = new Set([
     "playback.seek",
     "buzz.resolve",
 ]);
+const playerActions = new Set(["buzz", "playback.buffer"]);
 
 const PLAYER_STORAGE_PREFIX = "ntt.player.";
+const PLAYER_TOKEN_PREFIX = "ntt.playerToken.";
+const OWNER_TOKEN_PREFIX = "ntt.ownerToken.";
 function storageKey() {
     return `${PLAYER_STORAGE_PREFIX}${props.roomId}`;
+}
+function tokenStorageKey(prefix) {
+    return `${prefix}${props.roomId}`;
 }
 function loadStoredPlayerId() {
     try {
@@ -720,7 +726,41 @@ function setPlayerId(id) {
     return v;
 }
 
+const playerToken = ref("");
+const ownerToken = ref("");
+function loadStoredToken(prefix) {
+    try {
+        return sessionStorage.getItem(tokenStorageKey(prefix)) || "";
+    } catch {
+        return "";
+    }
+}
+function setPlayerToken(token) {
+    const v = token || "";
+    playerToken.value = v;
+    try {
+        if (v) sessionStorage.setItem(tokenStorageKey(PLAYER_TOKEN_PREFIX), v);
+        else sessionStorage.removeItem(tokenStorageKey(PLAYER_TOKEN_PREFIX));
+    } catch {
+        // ignore
+    }
+    return v;
+}
+function setOwnerToken(token) {
+    const v = token || "";
+    ownerToken.value = v;
+    try {
+        if (v) sessionStorage.setItem(tokenStorageKey(OWNER_TOKEN_PREFIX), v);
+        else sessionStorage.removeItem(tokenStorageKey(OWNER_TOKEN_PREFIX));
+    } catch {
+        // ignore
+    }
+    return v;
+}
+
 setPlayerId(loadStoredPlayerId());
+setPlayerToken(loadStoredToken(PLAYER_TOKEN_PREFIX));
+setOwnerToken(loadStoredToken(OWNER_TOKEN_PREFIX));
 
 const canControlPlayback = computed(
     () =>
@@ -899,7 +939,6 @@ function syncPlayerFromSnapshot() {
         const match = snapshot.value.players.find((p) => p.sub === sub);
         if (match) {
             setPlayerId(match.playerId);
-            sendCurrentBufferState();
         }
     }
 }
@@ -994,7 +1033,6 @@ async function setupYouTubePlayer() {
                 ytReady.value = true;
                 applyPlaybackQualityLow();
                 syncPlayerToSnapshot();
-                sendCurrentBufferState();
             },
             onStateChange: handleYTStateChange,
         },
@@ -1012,10 +1050,6 @@ function destroyYouTubePlayer() {
     ytReady.value = false;
     currentVideoId.value = "";
     clearScheduledStart();
-    if (bufferingReportTimer) {
-        clearTimeout(bufferingReportTimer);
-        bufferingReportTimer = null;
-    }
 }
 
 function clearScheduledStart() {
@@ -1056,41 +1090,15 @@ function applyPlaybackQualityLow() {
     }
 }
 
-function getCurrentBufferingState() {
-    if (!ytPlayer.value?.getPlayerState || !window.YT?.PlayerState) return null;
-    const state = ytPlayer.value.getPlayerState();
-    if (state === window.YT.PlayerState.BUFFERING) return true;
-    if (
-        state === window.YT.PlayerState.CUED ||
-        state === window.YT.PlayerState.PLAYING ||
-        state === window.YT.PlayerState.PAUSED ||
-        state === window.YT.PlayerState.ENDED
-    ) {
-        return false;
-    }
-    return null;
-}
-
-function sendCurrentBufferState() {
-    const buffering = getCurrentBufferingState();
-    if (buffering === null) return;
-    reportPlaybackBuffering(buffering);
-}
-
 function reportPlaybackBuffering(buffering) {
-    if (!currentPlayerConnected.value) return;
-    const resolvedPlayerId = playerId.value || currentPlayer.value?.playerId;
-    if (!resolvedPlayerId) return;
+    if (!currentPlayerConnected.value || !playerId.value) return;
     if (lastBufferingReport === buffering) return;
     const sent = sendRoomCommand("playback.buffer", {
-        playerId: resolvedPlayerId,
+        playerId: playerId.value,
         buffering,
     });
     if (!sent) return;
     lastBufferingReport = buffering;
-    if (!playerId.value) {
-        setPlayerId(resolvedPlayerId);
-    }
 }
 
 function handleYTStateChange(evt) {
@@ -1098,24 +1106,12 @@ function handleYTStateChange(evt) {
     const YT = window.YT;
     if (!YT?.PlayerState) return;
     if (state === YT.PlayerState.BUFFERING) {
-        if (bufferingReportTimer) return;
-        bufferingReportTimer = setTimeout(() => {
-            bufferingReportTimer = null;
-            sendCurrentBufferState();
-        }, 300);
+        if (!isPlaybackLive.value) return;
+        reportPlaybackBuffering(true);
         return;
     }
-    if (bufferingReportTimer) {
-        clearTimeout(bufferingReportTimer);
-        bufferingReportTimer = null;
-    }
-    if (
-        state === YT.PlayerState.CUED ||
-        state === YT.PlayerState.PLAYING ||
-        state === YT.PlayerState.PAUSED ||
-        state === YT.PlayerState.ENDED
-    ) {
-        sendCurrentBufferState();
+    if (state === YT.PlayerState.CUED || state === YT.PlayerState.PLAYING) {
+        reportPlaybackBuffering(false);
     }
 }
 
@@ -1162,6 +1158,16 @@ function syncPlayerToSnapshot() {
             if (waitingForStart) {
                 scheduleStart(desired.startAtMs, targetSec);
             }
+        }
+        const state = ytPlayer.value.getPlayerState
+            ? ytPlayer.value.getPlayerState()
+            : null;
+        if (state === window.YT?.PlayerState?.BUFFERING) {
+            if (!desired.paused && !waitingForStart) {
+                reportPlaybackBuffering(true);
+            }
+        } else if (state !== null) {
+            reportPlaybackBuffering(false);
         }
         return;
     }
@@ -1215,6 +1221,14 @@ function syncPlayerToSnapshot() {
             ytPlayer.value.setPlaybackRate(1);
         }
     }
+
+    if (state === window.YT?.PlayerState?.BUFFERING) {
+        if (!desired.paused && !waitingForStart) {
+            reportPlaybackBuffering(true);
+        }
+    } else if (state !== null) {
+        reportPlaybackBuffering(false);
+    }
 }
 
 async function refreshMyPlaylists() {
@@ -1232,11 +1246,9 @@ async function loadSelectedPlaylist() {
     busyOwner.value = true;
     ownerError.value = "";
     try {
-        const sent = sendRoomCommand("playlist.load", {
+        await ensureRoomCommand("playlist.load", {
             playlistId: selectedPlaylistId.value,
-            sub: auth.state.sub || "",
         });
-        if (!sent) throw new Error("Realtime connection required.");
         // Do not apply REST response to local room state.
         // Room state (playlist, playback, players, scores) is driven by WebSocket snapshots.
     } catch (e) {
@@ -1251,11 +1263,7 @@ async function togglePause() {
     ownerError.value = "";
     try {
         const paused = !snapshot.value?.playback?.paused;
-        const sent = sendRoomCommand("playback.pause", {
-            paused,
-            sub: auth.state.sub || "",
-        });
-        if (!sent) throw new Error("Realtime connection required.");
+        await ensureRoomCommand("playback.pause", { paused });
         // Do not apply REST response; wait for WS `room.snapshot`.
     } catch (e) {
         ownerError.value = e?.message || "Failed to toggle pause";
@@ -1271,13 +1279,11 @@ async function setTrackIndex(
     busyOwner.value = true;
     ownerError.value = "";
     try {
-        const sent = sendRoomCommand("playback.set", {
+        await ensureRoomCommand("playback.set", {
             trackIndex,
             paused,
             positionMs,
-            sub: auth.state.sub || "",
         });
-        if (!sent) throw new Error("Realtime connection required.");
         // Do not apply REST response; wait for WS `room.snapshot`.
     } catch (e) {
         ownerError.value = e?.message || "Failed to set playback";
@@ -1309,11 +1315,9 @@ async function seekToMs(positionMs) {
     busyOwner.value = true;
     ownerError.value = "";
     try {
-        const sent = sendRoomCommand("playback.seek", {
+        await ensureRoomCommand("playback.seek", {
             positionMs: Math.floor(positionMs),
-            sub: auth.state.sub || "",
         });
-        if (!sent) throw new Error("Realtime connection required.");
         // Do not apply REST response; wait for WS `room.snapshot`.
     } catch (e) {
         ownerError.value = e?.message || "Failed to seek";
@@ -1336,11 +1340,7 @@ async function kick(pid) {
     busyOwner.value = true;
     ownerError.value = "";
     try {
-        const sent = sendRoomCommand("kick", {
-            playerId: pid,
-            sub: auth.state.sub || "",
-        });
-        if (!sent) throw new Error("Realtime connection required.");
+        await ensureRoomCommand("kick", { playerId: pid });
         // Do not apply REST response; roster updates come via WS `room.snapshot`.
     } catch (e) {
         ownerError.value = e?.message || "Failed to kick player";
@@ -1353,12 +1353,7 @@ async function scoreDelta(pid, delta) {
     busyOwner.value = true;
     ownerError.value = "";
     try {
-        const sent = sendRoomCommand("score.add", {
-            playerId: pid,
-            delta,
-            sub: auth.state.sub || "",
-        });
-        if (!sent) throw new Error("Realtime connection required.");
+        await ensureRoomCommand("score.add", { playerId: pid, delta });
         // Do not apply REST response; score updates come via WS `room.snapshot`.
     } catch (e) {
         ownerError.value = e?.message || "Failed to update score";
@@ -1375,12 +1370,10 @@ async function scoreSetPrompt(pid, current) {
     busyOwner.value = true;
     ownerError.value = "";
     try {
-        const sent = sendRoomCommand("score.set", {
+        await ensureRoomCommand("score.set", {
             playerId: pid,
             score: Math.trunc(n),
-            sub: auth.state.sub || "",
         });
-        if (!sent) throw new Error("Realtime connection required.");
         // Do not apply REST response; score updates come via WS `room.snapshot`.
     } catch (e) {
         ownerError.value = e?.message || "Failed to set score";
@@ -1397,7 +1390,13 @@ async function joinRoomWithProfile({
     persist = false,
 }) {
     if (!props.roomId || roomClosedReason.value) return;
-    if (currentPlayerConnected.value) return;
+    if (
+        currentPlayerConnected.value &&
+        playerToken.value &&
+        (!isOwner.value || ownerToken.value)
+    ) {
+        return;
+    }
     if (wasKicked.value) return;
     const safeNickname = (nickname || "").trim();
     joining.value = true;
@@ -1410,6 +1409,12 @@ async function joinRoomWithProfile({
             password: password || undefined,
         });
         setPlayerId(res?.PlayerID || res?.playerId || "");
+        setPlayerToken(res?.PlayerToken || res?.playerToken || "");
+        if (res?.OwnerToken || res?.ownerToken) {
+            setOwnerToken(res?.OwnerToken || res?.ownerToken || "");
+        } else {
+            setOwnerToken("");
+        }
         wasKicked.value = false;
         roomClosedReason.value = "";
         if (persist) {
@@ -1443,7 +1448,13 @@ async function joinFromModal() {
 async function maybeAutoJoin() {
     if (!snapshot.value) return;
     if (roomClosedReason.value) return;
-    if (currentPlayerConnected.value) return;
+    if (
+        currentPlayerConnected.value &&
+        playerToken.value &&
+        (!isOwner.value || ownerToken.value)
+    ) {
+        return;
+    }
     if (requiresRoomPassword.value) return;
     if (joining.value) return;
     if (canSkipNickname.value) {
@@ -1471,6 +1482,8 @@ async function leave({ silent = false } = {}) {
             playerId: playerId.value,
         });
         setPlayerId("");
+        setPlayerToken("");
+        setOwnerToken("");
     } catch (e) {
         if (!silent) {
             playerError.value = e?.message || "Failed to leave room";
@@ -1490,10 +1503,9 @@ async function buzz() {
     buzzing.value = true;
     playerError.value = "";
     try {
-        const sent = sendRoomCommand("buzz", {
+        await ensureRoomCommand("buzz", {
             playerId: playerId.value,
         });
-        if (!sent) throw new Error("Realtime connection required.");
     } catch (e) {
         playerError.value = e?.message || "Failed to buzz";
     } finally {
@@ -1506,12 +1518,10 @@ async function resolveBuzz(correct) {
     resolvingBuzz.value = true;
     ownerError.value = "";
     try {
-        const sent = sendRoomCommand("buzz.resolve", {
+        await ensureRoomCommand("buzz.resolve", {
             playerId: buzzModal.value.playerId,
             correct,
-            sub: auth.state.sub || "",
         });
-        if (!sent) throw new Error("Realtime connection required.");
         buzzModal.value = null;
     } catch (e) {
         ownerError.value = e?.message || "Failed to resolve buzz";
@@ -1521,19 +1531,74 @@ async function resolveBuzz(correct) {
 }
 
 // WS connection
+function realtimeErrorFor(action) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return "Realtime connection required. Please wait for the room connection to finish.";
+    }
+    if (ownerActions.has(action) && !ownerToken.value) {
+        return "Join the room to control playback.";
+    }
+    if (playerActions.has(action) && !playerToken.value) {
+        return "Join the room to use the buzzer.";
+    }
+    return "Realtime connection required.";
+}
+
 function sendRoomCommand(action, payload) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    lastRealtimeError.value = "";
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        lastRealtimeError.value = realtimeErrorFor(action);
+        return false;
+    }
+    const command = { action, ...payload };
+    if (ownerActions.has(action)) {
+        if (!ownerToken.value) {
+            lastRealtimeError.value = realtimeErrorFor(action);
+            return false;
+        }
+        command.ownerToken = ownerToken.value;
+    }
+    if (playerActions.has(action)) {
+        if (!playerToken.value) {
+            lastRealtimeError.value = realtimeErrorFor(action);
+            return false;
+        }
+        command.playerToken = playerToken.value;
+    }
     try {
         ws.send(
             JSON.stringify({
                 type: "room.command",
                 roomId: props.roomId,
-                payload: { action, ...payload },
+                payload: command,
             }),
         );
         return true;
     } catch {
+        lastRealtimeError.value = realtimeErrorFor(action);
         return false;
+    }
+}
+
+async function ensureRoomCommand(action, payload) {
+    if (wsStatus.value === "disconnected" || wsStatus.value === "error") {
+        connectWS();
+    }
+    if (wsStatus.value !== "connected") {
+        const timeoutMs = 1200;
+        const start = Date.now();
+        while (
+            wsStatus.value !== "connected" &&
+            Date.now() - start < timeoutMs
+        ) {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+    }
+    const sent = sendRoomCommand(action, payload);
+    if (!sent) {
+        throw new Error(
+            lastRealtimeError.value || "Realtime connection required.",
+        );
     }
 }
 
@@ -1547,7 +1612,6 @@ function connectWS() {
 
     ws.onopen = () => {
         wsStatus.value = "connected";
-        sendCurrentBufferState();
     };
 
     ws.onclose = () => {
@@ -1717,7 +1781,6 @@ onMounted(async () => {
     connectWS();
     syncTimer = setInterval(() => {
         syncPlayerToSnapshot();
-        sendCurrentBufferState();
     }, 1000);
 });
 
