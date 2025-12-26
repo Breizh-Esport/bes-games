@@ -65,7 +65,7 @@
                         <div class="playlist-title">
                             <div class="playlist-name">{{ pl.name }}</div>
                             <div class="muted small">
-                                {{ pl.items?.length || 0 }} tracks • updated
+                                {{ pl.items?.length || 0 }} tracks - updated
                                 {{ formatRelative(pl.updatedAt) }}
                             </div>
                         </div>
@@ -189,7 +189,7 @@
                                                     it.youtubeUrl
                                                 }}
                                             </a>
-                                            • added
+                                            - added
                                             {{ formatRelative(it.addedAt) }}
                                         </div>
                                     </template>
@@ -667,3 +667,4 @@ onMounted(() => {
     color: inherit;
 }
 </style>
+

@@ -102,11 +102,10 @@ type Options struct {
 }
 
 func NewServer(coreRepo *core.Repo, nttRepo *namethattune.Repo, rt *realtime.Registry) *Server {
-	return &Server{
+	s := &Server{
 		coreRepo:              coreRepo,
 		nttRepo:               nttRepo,
 		rt:                    rt,
-		rooms:                 newRoomLifecycle(nttRepo, rt),
 		buzzCD:                make(map[string]map[string]time.Time),
 		playerTokens:          make(map[string]map[string]string),
 		ownerTokens:           make(map[string]string),
@@ -117,6 +116,8 @@ func NewServer(coreRepo *core.Repo, nttRepo *namethattune.Repo, rt *realtime.Reg
 		playbackStartAt:       make(map[string]time.Time),
 		playbackAutoPause:     make(map[string]bool),
 	}
+	s.rooms = newRoomLifecycle(nttRepo, rt, s.clearRoomState)
+	return s
 }
 
 func (s *Server) Handler(opts Options) http.Handler {
@@ -535,6 +536,19 @@ func (s *Server) clearPlaybackState(roomID string) {
 	delete(s.playbackWaitingBuffer, roomID)
 	delete(s.playbackStartAt, roomID)
 	delete(s.playbackAutoPause, roomID)
+}
+
+func (s *Server) clearRoomState(roomID string) {
+	s.tokenMu.Lock()
+	delete(s.playerTokens, roomID)
+	delete(s.ownerTokens, roomID)
+	s.tokenMu.Unlock()
+
+	s.buzzMu.Lock()
+	delete(s.buzzCD, roomID)
+	s.buzzMu.Unlock()
+
+	s.clearPlaybackState(roomID)
 }
 
 // =============================

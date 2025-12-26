@@ -839,15 +839,14 @@ FOR UPDATE;
 		if err == nil {
 			const upd = `
 UPDATE room_players
-SET nickname = $3,
-    picture_url = $4,
+SET nickname = $2,
+    picture_url = $3,
     connected = TRUE,
     left_at = NULL,
-    updated_at = now(),
-    score = CASE WHEN user_sub = $2 THEN 0 ELSE score END
+    updated_at = now()
 WHERE id::uuid = $1;
 `
-			if _, err := tx.Exec(ctx, upd, playerID, userSub, nickname, pictureURL); err != nil {
+			if _, err := tx.Exec(ctx, upd, playerID, nickname, pictureURL); err != nil {
 				return JoinResult{}, fmt.Errorf("join room reactivate: %w", err)
 			}
 		} else if errors.Is(err, pgx.ErrNoRows) {

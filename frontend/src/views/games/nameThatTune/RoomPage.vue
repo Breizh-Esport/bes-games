@@ -2,13 +2,6 @@
     <main class="page">
         <header class="header">
             <div class="brand">
-                <div class="row row-center row-gap-sm">
-                    <RouterLink class="btn btn-ghost" to="/">Home</RouterLink>
-                    <RouterLink class="btn btn-ghost" to="/profile">
-                        Profile
-                    </RouterLink>
-                </div>
-
                 <h1 class="title">
                     Room
                     <span class="muted" v-if="roomId">({{ roomId }})</span>
@@ -880,7 +873,11 @@ const currentPlayerConnected = computed(
     () => !!currentPlayer.value && currentPlayer.value.connected,
 );
 
-const requiresRoomPassword = computed(() => !!snapshot.value?.hasPassword);
+const requiresRoomPassword = computed(() => {
+    if (!snapshot.value?.hasPassword) return false;
+    if (auth.isAuthenticated.value && isOwner.value) return false;
+    return true;
+});
 const shouldShowBuzzer = computed(() => {
     if (isOwner.value) return false;
     const ownerSub = snapshot.value?.ownerSub;

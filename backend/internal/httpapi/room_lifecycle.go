@@ -21,14 +21,16 @@ const (
 type roomLifecycle struct {
 	repo        *namethattune.Repo
 	rt          *realtime.Registry
+	cleanup     func(roomID string)
 	mu          sync.Mutex
 	ownerTimers map[string]*time.Timer
 }
 
-func newRoomLifecycle(repo *namethattune.Repo, rt *realtime.Registry) *roomLifecycle {
+func newRoomLifecycle(repo *namethattune.Repo, rt *realtime.Registry, cleanup func(roomID string)) *roomLifecycle {
 	return &roomLifecycle{
 		repo:        repo,
 		rt:          rt,
+		cleanup:     cleanup,
 		ownerTimers: make(map[string]*time.Timer),
 	}
 }
@@ -96,6 +98,10 @@ func (l *roomLifecycle) closeRoom(ctx context.Context, roomID string, reason roo
 
 	if err := l.repo.DeleteRoom(ctx, roomID); err != nil && !errors.Is(err, core.ErrRoomNotFound) {
 		return err
+	}
+
+	if l.cleanup != nil {
+		l.cleanup(roomID)
 	}
 
 	if l.rt != nil {

@@ -6,12 +6,6 @@
                 Create or join rooms, then play with playlists and the buzzer.
             </p>
             <div class="hero-actions">
-                <RouterLink class="btn btn-ghost" to="/"
-                    >Back to games</RouterLink
-                >
-                <RouterLink class="btn btn-ghost" to="/profile"
-                    >Profile</RouterLink
-                >
                 <RouterLink
                     class="btn btn-ghost"
                     to="/games/name-that-tune/settings/playlists"
