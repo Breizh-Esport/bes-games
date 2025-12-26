@@ -71,7 +71,14 @@ func main() {
 	// --- Repo + API ---
 	coreRepo := core.NewRepo(pool)
 	nttRepo := namethattune.NewRepo(pool)
-	api := httpapi.NewServer(coreRepo, nttRepo, rt)
+
+	authSvc, err := authFromEnv(ctx, coreRepo)
+	if err != nil {
+		logger.Printf("auth config error: %v", err)
+		os.Exit(1)
+	}
+
+	api := httpapi.NewServer(coreRepo, nttRepo, rt, authSvc)
 
 	allowedOrigins := splitCommaEnv("BES_CORS_ALLOWED_ORIGINS")
 	handler := api.Handler(httpapi.Options{
@@ -172,6 +179,75 @@ func splitCommaEnv(key string) []string {
 		return nil
 	}
 	return out
+}
+
+func authFromEnv(ctx context.Context, repo *core.Repo) (*httpapi.AuthService, error) {
+	issuer := strings.TrimSpace(os.Getenv("BES_OIDC_ISSUER_URL"))
+	clientID := strings.TrimSpace(os.Getenv("BES_OIDC_CLIENT_ID"))
+	if issuer == "" || clientID == "" {
+		return nil, nil
+	}
+
+	publicURL := strings.TrimSpace(os.Getenv("BES_PUBLIC_URL"))
+	cfg := httpapi.AuthConfig{
+		IssuerURL:              issuer,
+		ClientID:               clientID,
+		ClientSecret:           strings.TrimSpace(os.Getenv("BES_OIDC_CLIENT_SECRET")),
+		RedirectURL:            strings.TrimSpace(os.Getenv("BES_OIDC_REDIRECT_URL")),
+		PublicURL:              publicURL,
+		UIBaseURL:              strings.TrimSpace(os.Getenv("BES_UI_BASE_URL")),
+		Scopes:                 splitCommaEnv("BES_OIDC_SCOPES"),
+		Prompt:                 strings.TrimSpace(os.Getenv("BES_OIDC_PROMPT")),
+		OfflineAccess:          envBool("BES_OIDC_OFFLINE_ACCESS", false),
+		CookieSecret:           strings.TrimSpace(os.Getenv("BES_AUTH_COOKIE_SECRET")),
+		CookieName:             envOrDefault("BES_AUTH_COOKIE_NAME", "besgames_session"),
+		CookieDomain:           strings.TrimSpace(os.Getenv("BES_AUTH_COOKIE_DOMAIN")),
+		CookieSameSite:         parseSameSite(os.Getenv("BES_AUTH_COOKIE_SAMESITE")),
+		RefreshTokenTTL:        envDuration("BES_AUTH_REFRESH_TTL", 30*24*time.Hour),
+		AccessTokenFallbackTTL: envDuration("BES_AUTH_ACCESS_TTL", 5*time.Minute),
+		AllowLegacyHeader:      envBool("BES_AUTH_ALLOW_LEGACY_HEADER", false),
+	}
+	cfg.CookieSecure = envBool("BES_AUTH_COOKIE_SECURE", strings.HasPrefix(publicURL, "https://"))
+
+	return httpapi.NewAuthService(ctx, repo, cfg)
+}
+
+func envBool(key string, def bool) bool {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return def
+	}
+	return d
+}
+
+func parseSameSite(raw string) http.SameSite {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "strict":
+		return http.SameSiteStrictMode
+	case "none":
+		return http.SameSiteNoneMode
+	default:
+		return http.SameSiteLaxMode
+	}
 }
 
 func withLogging(logger *log.Logger, next http.Handler) http.Handler {

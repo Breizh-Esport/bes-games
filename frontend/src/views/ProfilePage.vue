@@ -10,15 +10,16 @@
         </header>
 
         <section class="card" v-if="!auth.isAuthenticated.value">
-            <h2 class="h2">Not authenticated</h2>
+            <h2 class="h2">Sign in required</h2>
             <p class="muted">
-                Profile and game settings require authentication (OIDC). For
-                now, go back to Home and set a simulated subject (<code
-                    class="code"
-                    >sub</code
-                >).
+                Profile and game settings require authentication.
             </p>
-            <RouterLink class="btn" to="/">Go to games</RouterLink>
+            <div class="actions">
+                <button class="btn" @click="auth.login()">Sign in</button>
+                <RouterLink class="btn btn-ghost" to="/"
+                    >Go to games</RouterLink
+                >
+            </div>
         </section>
 
         <template v-else>

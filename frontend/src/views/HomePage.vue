@@ -25,45 +25,29 @@
         </section>
 
         <section class="card">
-            <h2 class="h2">Authentication (temporary)</h2>
+            <h2 class="h2">Account</h2>
             <p class="muted">
-                Authentication is currently a placeholder. Set an arbitrary
-                <code class="code">sub</code> to simulate being logged in (sent
-                as <code class="code">X-User-Sub</code> to the backend).
+                Sign in to manage your profile, playlists, and room ownership.
             </p>
 
             <div class="row">
-                <div class="col">
-                    <label class="label" for="sub">User subject (sub)</label>
-                    <input
-                        id="sub"
-                        v-model="loginSub"
-                        class="input"
-                        type="text"
-                        placeholder="e.g. oidc|john.doe"
-                        autocomplete="off"
-                    />
-                </div>
-
                 <div class="actions">
                     <button
                         class="btn"
-                        @click="onLogin"
-                        :disabled="!loginSubTrimmed"
+                        @click="auth.login()"
+                        :disabled="auth.isAuthenticated.value"
                     >
-                        Set sub
+                        Sign in
                     </button>
                     <button
                         class="btn btn-ghost"
-                        @click="onLogout"
+                        @click="auth.logout()"
                         :disabled="!auth.isAuthenticated.value"
                     >
-                        Clear
+                        Sign out
                     </button>
                 </div>
-            </div>
 
-            <div class="row">
                 <div
                     class="badge"
                     :class="
@@ -96,7 +80,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from "vue";
+import { onMounted, ref } from "vue";
 import { RouterLink } from "vue-router";
 import { api, getApiBaseUrl } from "../lib/api";
 import { useAuth } from "../stores/auth";
@@ -104,20 +88,6 @@ import { useAuth } from "../stores/auth";
 const auth = useAuth();
 
 const apiBase = getApiBaseUrl();
-
-// Login placeholder
-const loginSub = ref(auth.state.sub || "");
-const loginSubTrimmed = computed(() => (loginSub.value || "").trim());
-
-function onLogin() {
-    if (!loginSubTrimmed.value) return;
-    auth.loginWithSub(loginSubTrimmed.value);
-}
-
-function onLogout() {
-    auth.logout();
-    loginSub.value = "";
-}
 
 function gameLink(id) {
     return `/games/${encodeURIComponent(id)}`;
@@ -224,28 +194,6 @@ onMounted(() => {
     align-items: flex-end;
     flex-wrap: wrap;
     margin-top: 12px;
-}
-
-.col {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    min-width: 220px;
-    flex: 1 1 220px;
-}
-
-.label {
-    font-size: 0.9rem;
-    opacity: 0.9;
-}
-
-.input {
-    padding: 10px 12px;
-    border-radius: 10px;
-    border: 1px solid var(--color-border, rgba(255, 255, 255, 0.12));
-    background: var(--color-background, rgba(0, 0, 0, 0.2));
-    color: inherit;
-    outline: none;
 }
 
 .actions {

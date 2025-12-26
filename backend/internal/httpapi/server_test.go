@@ -407,7 +407,7 @@ func newTestServerNoDB(t *testing.T) *Server {
 
 	// For routes that don't require DB (like /healthz), we can run a server with nil deps.
 	// Handlers that touch DB will panic; tests must not call them here.
-	return NewServer(nil, nil, realtime.NewRegistry())
+	return NewServer(nil, nil, realtime.NewRegistry(), nil)
 }
 
 func newTestServer(t *testing.T, pool *pgxpool.Pool) *Server {
@@ -415,7 +415,7 @@ func newTestServer(t *testing.T, pool *pgxpool.Pool) *Server {
 	coreRepo := core.NewRepo(pool)
 	nttRepo := namethattune.NewRepo(pool)
 	rt := realtime.NewRegistry()
-	return NewServer(coreRepo, nttRepo, rt)
+	return NewServer(coreRepo, nttRepo, rt, nil)
 }
 
 func freshDB(t *testing.T, ctx context.Context) *pgxpool.Pool {

@@ -6,9 +6,7 @@ This repository contains:
 - Go backend (`backend/`) providing a REST + WebSocket API
 - Vue 3 frontend (`frontend/`) providing a multi-page UI (Games, Profile, per-game pages)
 
-Authentication is currently a placeholder:
-- The frontend stores an arbitrary `sub` in `localStorage`
-- Authenticated backend requests send it via `X-User-Sub`
+Authentication uses OIDC with a server-managed session cookie.
 
 ## Project layout
 
@@ -38,6 +36,35 @@ Health check:
 curl http://localhost:8080/healthz
 ```
 
+### OIDC configuration
+
+Set these env vars to enable authentication:
+
+- `BES_OIDC_ISSUER_URL` (required)
+- `BES_OIDC_CLIENT_ID` (required)
+- `BES_OIDC_CLIENT_SECRET` (optional, depending on your provider)
+- `BES_PUBLIC_URL` (required unless you set `BES_OIDC_REDIRECT_URL`)
+- `BES_AUTH_COOKIE_SECRET` (required, random string)
+
+Optional:
+- `BES_OIDC_REDIRECT_URL` (override the default redirect)
+- `BES_UI_BASE_URL` (allowed returnTo base, e.g. `http://localhost:5173`)
+- `BES_OIDC_SCOPES` (comma-separated, default `openid,email,profile`)
+- `BES_OIDC_PROMPT` (provider-specific prompt value)
+- `BES_OIDC_OFFLINE_ACCESS` (`true` to request refresh tokens)
+- `BES_AUTH_COOKIE_NAME` (default `besgames_session`)
+- `BES_AUTH_COOKIE_DOMAIN`
+- `BES_AUTH_COOKIE_SECURE` (defaults based on `BES_PUBLIC_URL`)
+- `BES_AUTH_COOKIE_SAMESITE` (`lax`, `strict`, `none`)
+- `BES_AUTH_REFRESH_TTL` (default `720h`)
+- `BES_AUTH_ACCESS_TTL` (fallback default `5m`)
+
+Redirect URI for your OIDC client:
+- `${BES_PUBLIC_URL}/auth/callback` (or `BES_OIDC_REDIRECT_URL` if set)
+
+Backchannel logout URI:
+- `${BES_PUBLIC_URL}/auth/backchannel-logout`
+
 ### Frontend (Vue)
 
 ```sh
@@ -66,6 +93,4 @@ docker compose up --build
 ## Next steps
 
 - Add `gameId` to the room schema so multiple games can coexist cleanly.
-- Replace placeholder auth with real OIDC login/registration and token validation.
 - Implement actual YouTube playback for Name That Tune (player embed + drift correction).
-

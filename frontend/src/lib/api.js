@@ -1,17 +1,14 @@
 // Minimal API client for the bes-games backend.
 //
-// Auth model (temporary):
-// - The backend expects an authenticated user subject in header `X-User-Sub`
-// - Real OIDC login/registration will be wired later; for now we store a "sub" in localStorage
-//
-// Anonymous users can still call endpoints that do not require auth.
+// Auth model:
+// - OIDC session cookie (HTTP-only) issued by the backend.
+// - Anonymous users can still call endpoints that do not require auth.
 //
 // You can change the base URL with:
 //   - VITE_API_BASE_URL (e.g. 'http://localhost:8080')
 // Default is 'http://localhost:8080'
 
 const DEFAULT_BASE_URL = "http://localhost:8080";
-const LS_USER_SUB_KEY = "besgames.userSub";
 const LS_GUEST_SUB_KEY = "besgames.guestSub";
 
 export function getApiBaseUrl() {
@@ -19,14 +16,6 @@ export function getApiBaseUrl() {
     /\/+$/,
     "",
   );
-}
-
-export function getUserSub() {
-  try {
-    return (localStorage.getItem(LS_USER_SUB_KEY) || "").trim();
-  } catch {
-    return "";
-  }
 }
 
 function getOrCreateGuestSub() {
@@ -46,21 +35,6 @@ function getOrCreateGuestSub() {
   }
 }
 
-export function setUserSub(sub) {
-  const v = (sub || "").trim();
-  try {
-    if (!v) localStorage.removeItem(LS_USER_SUB_KEY);
-    else localStorage.setItem(LS_USER_SUB_KEY, v);
-  } catch {
-    // ignore
-  }
-  return v;
-}
-
-export function clearUserSub() {
-  return setUserSub("");
-}
-
 export class ApiError extends Error {
   constructor(
     message,
@@ -75,16 +49,11 @@ export class ApiError extends Error {
   }
 }
 
-function buildHeaders({ auth = false, extraHeaders = {} } = {}) {
+function buildHeaders({ extraHeaders = {} } = {}) {
   const headers = {
     Accept: "application/json",
     ...extraHeaders,
   };
-
-  if (auth) {
-    const sub = getUserSub();
-    if (sub) headers["X-User-Sub"] = sub;
-  }
 
   return headers;
 }
@@ -110,6 +79,7 @@ async function request(
     method,
     headers: buildHeaders({ auth, extraHeaders: headers }),
     signal,
+    credentials: "include",
   };
 
   if (body !== undefined) {
@@ -164,17 +134,14 @@ export const api = {
   },
 
   joinRoom(gameId, roomId, { nickname, pictureUrl, password } = {}) {
-    const userSub = getUserSub();
     const headers = {};
-    if (!userSub) {
-      const guestSub = getOrCreateGuestSub();
-      if (guestSub) headers["X-User-Sub"] = guestSub;
-    }
+    const guestSub = getOrCreateGuestSub();
+    if (guestSub) headers["X-Guest-Sub"] = guestSub;
     return request(
       `${gamePrefix(gameId)}/rooms/${encodeURIComponent(roomId)}/join`,
       {
         method: "POST",
-        auth: true, // use auth sub when set; otherwise attach a guest sub
+        auth: true,
         headers,
         body: { nickname, pictureUrl, password },
       },
@@ -273,7 +240,7 @@ export const api = {
 // Backend WS endpoint: GET /api/games/:gameId/rooms/:roomId/ws
 // Sends `room.snapshot` first, then incremental events.
 //
-// Note: Browser WebSocket cannot set custom headers reliably (no X-User-Sub),
+// Note: Browser WebSocket cannot set custom headers reliably,
 // which is fine for read-only room events.
 export function roomWebSocketUrl(gameId, roomId) {
   const base = getApiBaseUrl();

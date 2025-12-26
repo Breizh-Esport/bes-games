@@ -27,10 +27,9 @@ const playbackSyncLead = 1500 * time.Millisecond
 
 // Server provides the HTTP API (REST + WebSocket) for bes-games.
 //
-// Auth model (still temporary until real OIDC validation is implemented):
-//   - Authenticated requests must include:
-//     X-User-Sub: <oidc subject>
-//   - Anonymous users can join rooms without it.
+// Auth model:
+//   - Authenticated requests use an OIDC-backed server session cookie.
+//   - Anonymous users can still join rooms without auth.
 //
 // Persistence model:
 //   - Core user profile is stored in Postgres via core.Repo.
@@ -82,6 +81,7 @@ type Server struct {
 	playbackWaitingBuffer map[string]bool
 	playbackStartAt       map[string]time.Time
 	playbackAutoPause     map[string]bool
+	auth                  *AuthService
 }
 
 type wsOriginPatternsCtxKey struct{}
@@ -101,7 +101,7 @@ type Options struct {
 	ReadHeaderTimeout time.Duration
 }
 
-func NewServer(coreRepo *core.Repo, nttRepo *namethattune.Repo, rt *realtime.Registry) *Server {
+func NewServer(coreRepo *core.Repo, nttRepo *namethattune.Repo, rt *realtime.Registry, auth *AuthService) *Server {
 	s := &Server{
 		coreRepo:              coreRepo,
 		nttRepo:               nttRepo,
@@ -115,6 +115,7 @@ func NewServer(coreRepo *core.Repo, nttRepo *namethattune.Repo, rt *realtime.Reg
 		playbackWaitingBuffer: make(map[string]bool),
 		playbackStartAt:       make(map[string]time.Time),
 		playbackAutoPause:     make(map[string]bool),
+		auth:                  auth,
 	}
 	s.rooms = newRoomLifecycle(nttRepo, rt, s.clearRoomState)
 	return s
@@ -141,10 +142,12 @@ func (s *Server) Handler(opts Options) http.Handler {
 		})
 	})
 
+	r.Use(s.authMiddleware)
+
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   allowed,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-User-Sub"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-User-Sub", "X-Guest-Sub"},
 		ExposedHeaders:   []string{},
 		AllowCredentials: true,
 		MaxAge:           300,
@@ -156,6 +159,16 @@ func (s *Server) Handler(opts Options) http.Handler {
 			"time":   time.Now().UTC().Format(time.RFC3339Nano),
 		})
 	})
+
+	if s.auth != nil {
+		r.Route("/auth", func(auth chi.Router) {
+			auth.Get("/login", s.handleAuthLogin)
+			auth.Get("/callback", s.handleAuthCallback)
+			auth.Get("/logout", s.handleAuthLogout)
+			auth.Post("/logout", s.handleAuthLogout)
+			auth.Post("/backchannel-logout", s.handleBackchannelLogout)
+		})
+	}
 
 	r.Route("/api", func(api chi.Router) {
 		api.Get("/games", s.handleListGames)
@@ -206,7 +219,16 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func userSub(r *http.Request) string {
+	if v := r.Context().Value(authContextKey{}); v != nil {
+		if info, ok := v.(authInfo); ok {
+			return strings.TrimSpace(info.Sub)
+		}
+	}
 	return strings.TrimSpace(r.Header.Get("X-User-Sub"))
+}
+
+func guestSub(r *http.Request) string {
+	return strings.TrimSpace(r.Header.Get("X-Guest-Sub"))
 }
 
 func roomIDParam(r *http.Request) string {
@@ -1170,7 +1192,13 @@ func (s *Server) handleJoinRoom(w http.ResponseWriter, r *http.Request) {
 	joinRes, err := s.nttRepo.JoinRoom(
 		r.Context(),
 		roomID,
-		userSub(r),
+		func() string {
+			sub := userSub(r)
+			if sub != "" {
+				return sub
+			}
+			return guestSub(r)
+		}(),
 		strings.TrimSpace(body.Nickname),
 		strings.TrimSpace(body.PictureURL),
 		strings.TrimSpace(body.Password),

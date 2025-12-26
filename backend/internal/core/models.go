@@ -11,6 +11,20 @@ type UserProfile struct {
 	UpdatedAt  time.Time `json:"updatedAt"`
 }
 
+type UserSession struct {
+	ID               string
+	Sub              string
+	SID              string
+	RefreshToken     string
+	AccessToken      string
+	IDToken          string
+	AccessExpiresAt  time.Time
+	RefreshExpiresAt time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	RevokedAt        *time.Time
+}
+
 // Domain-level errors shared across games.
 var (
 	// Rooms / players

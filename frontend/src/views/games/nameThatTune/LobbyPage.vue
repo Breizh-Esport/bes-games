@@ -17,45 +17,30 @@
         </section>
 
         <section class="card">
-            <h2 class="h2">Login</h2>
+            <h2 class="h2">Account</h2>
             <p class="muted">
-                Login/registration will be done through an OIDC provider. For
-                now, this is a placeholder: set a subject string to simulate
-                being authenticated.
+                Sign in to create rooms, manage playlists, and keep your profile
+                synced.
             </p>
 
             <div class="row">
-                <div class="col">
-                    <label class="label" for="sub">User subject (sub)</label>
-                    <input
-                        id="sub"
-                        v-model="loginSub"
-                        class="input"
-                        type="text"
-                        placeholder="e.g. oidc|john.doe"
-                        autocomplete="off"
-                    />
-                </div>
-
                 <div class="actions">
                     <button
                         class="btn"
-                        @click="onLogin"
-                        :disabled="!loginSubTrimmed"
+                        @click="auth.login()"
+                        :disabled="auth.isAuthenticated.value"
                     >
-                        Set sub
+                        Sign in
                     </button>
                     <button
                         class="btn btn-ghost"
-                        @click="onLogout"
+                        @click="auth.logout()"
                         :disabled="!auth.isAuthenticated.value"
                     >
-                        Clear
+                        Sign out
                     </button>
                 </div>
-            </div>
 
-            <div class="row">
                 <div
                     class="badge"
                     :class="
@@ -306,7 +291,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from "vue";
+import { onMounted, ref } from "vue";
 import { RouterLink, useRouter } from "vue-router";
 import { api, getApiBaseUrl } from "../../../lib/api";
 import { useAuth } from "../../../stores/auth";
@@ -316,20 +301,6 @@ const auth = useAuth();
 
 const apiBase = getApiBaseUrl();
 const gameId = "name-that-tune";
-
-// Login placeholder
-const loginSub = ref(auth.state.sub || "");
-const loginSubTrimmed = computed(() => (loginSub.value || "").trim());
-
-function onLogin() {
-    if (!loginSubTrimmed.value) return;
-    auth.loginWithSub(loginSubTrimmed.value);
-}
-
-function onLogout() {
-    auth.logout();
-    loginSub.value = "";
-}
 
 function roomLink(roomId) {
     return `/games/name-that-tune/rooms/${encodeURIComponent(roomId)}`;

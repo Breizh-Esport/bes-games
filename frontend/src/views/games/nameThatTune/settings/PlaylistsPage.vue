@@ -20,15 +20,16 @@
         </div>
 
         <section class="card-inner" v-if="!auth.isAuthenticated.value">
-            <h3 class="h3">Not authenticated</h3>
+            <h3 class="h3">Sign in required</h3>
             <p class="muted">
-                Playlists are tied to your account. Set a
-                <code class="code">sub</code> on the Home page or in the lobby
-                to simulate being logged in.
+                Playlists are tied to your account. Sign in to continue.
             </p>
-            <RouterLink class="btn" to="/games/name-that-tune"
-                >Go to lobby</RouterLink
-            >
+            <div class="actions">
+                <button class="btn" @click="auth.login()">Sign in</button>
+                <RouterLink class="btn btn-ghost" to="/games/name-that-tune"
+                    >Go to lobby</RouterLink
+                >
+            </div>
         </section>
 
         <template v-else>
@@ -667,4 +668,3 @@ onMounted(() => {
     color: inherit;
 }
 </style>
-
