@@ -702,7 +702,7 @@ const PRELOAD_READY_FRACTION = 0.2;
 const PRELOAD_READY_MAX_WAIT_MS = 2000;
 let preloadStartAtMs = 0;
 let bufferingDelayTimer = null;
-const BUFFER_REPORT_GRACE_MS = 1000;
+const BUFFER_REPORT_GRACE_MS = 2500;
 
 // Buzzer events
 const lastBuzz = ref(null);
@@ -1223,6 +1223,17 @@ function reportPlaybackBuffering(buffering) {
     lastBufferingReport = buffering;
 }
 
+function canReportBuffering() {
+    const startAt = playbackStartAtMs.value;
+    if (
+        Number.isFinite(startAt) &&
+        nowTick.value < startAt + BUFFER_REPORT_GRACE_MS
+    ) {
+        return false;
+    }
+    return true;
+}
+
 function handleYTStateChange(evt) {
     const state = evt?.data;
     const YT = window.YT;
@@ -1328,7 +1339,7 @@ function syncPlayerToSnapshot() {
             ? ytPlayer.value.getPlayerState()
             : null;
         if (state === window.YT?.PlayerState?.BUFFERING) {
-            if (!desired.paused && !waitingForStart) {
+            if (!desired.paused && !waitingForStart && canReportBuffering()) {
                 reportPlaybackBuffering(true);
             }
         } else if (state !== null) {
@@ -1391,7 +1402,7 @@ function syncPlayerToSnapshot() {
     }
 
     if (state === window.YT?.PlayerState?.BUFFERING) {
-        if (!desired.paused && !waitingForStart) {
+        if (!desired.paused && !waitingForStart && canReportBuffering()) {
             reportPlaybackBuffering(true);
         }
     } else if (state !== null) {
