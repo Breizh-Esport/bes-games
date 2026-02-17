@@ -89,8 +89,3 @@ docker compose up --build
 - Rooms (per-game): `GET /api/games/{gameId}/rooms`, `POST /api/games/{gameId}/rooms`, `GET /api/games/{gameId}/rooms/{roomId}`, join/leave, WS snapshots
 - Profile: `GET/PUT/DELETE /api/me`
 - Playlists (per-game): `GET/POST/PATCH /api/games/{gameId}/playlists`, `POST /api/games/{gameId}/playlists/{playlistId}/items`
-
-## Next steps
-
-- Add `gameId` to the room schema so multiple games can coexist cleanly.
-- Implement actual YouTube playback for Name That Tune (player embed + drift correction).
