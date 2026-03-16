@@ -5,10 +5,10 @@
 // - Anonymous users can still call endpoints that do not require auth.
 //
 // You can change the base URL with:
-//   - VITE_API_BASE_URL (e.g. 'http://localhost:8080')
-// Default is 'http://localhost:8080'
+//   - VITE_API_BASE_URL (e.g. 'http://localhost:5080')
+// Default is 'http://localhost:5080'
 
-const DEFAULT_BASE_URL = "http://localhost:8080";
+const DEFAULT_BASE_URL = "http://localhost:5080";
 const LS_GUEST_SUB_KEY = "besgames.guestSub";
 
 export function getApiBaseUrl() {

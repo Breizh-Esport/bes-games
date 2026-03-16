@@ -86,6 +86,25 @@ func TestRooms_CreateRoomRequiresAuth(t *testing.T) {
 	}
 }
 
+func TestRooms_LegacyHeaderDoesNotBypassCookieAuth(t *testing.T) {
+	t.Parallel()
+
+	srv := newTestServerNoDBWithAuth(t, &AuthService{
+		cfg: AuthConfig{CookieName: "besgames_session"},
+	})
+	h := srv.Handler(Options{AllowedOrigins: []string{"http://localhost:5173"}})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/games/name-that-tune/rooms", strings.NewReader(`{"name":"My Room"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-Sub", "spoofed-user")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status 401, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestRooms_CreateListJoinLeaveAndGetSnapshot(t *testing.T) {
 	t.Parallel()
 
@@ -227,8 +246,6 @@ func TestRooms_CreateListJoinLeaveAndGetSnapshot(t *testing.T) {
 }
 
 func TestProfileAndPlaylists_CRUDAndRoomLoad(t *testing.T) {
-	t.Parallel()
-
 	t.Setenv("BES_YOUTUBE_OEMBED_DISABLE", "1")
 
 	ctx := context.Background()
@@ -407,7 +424,13 @@ func newTestServerNoDB(t *testing.T) *Server {
 
 	// For routes that don't require DB (like /healthz), we can run a server with nil deps.
 	// Handlers that touch DB will panic; tests must not call them here.
-	return NewServer(nil, nil, realtime.NewRegistry(), nil)
+	return NewServer(nil, nil, realtime.NewRegistry(), nil, NewNameThatTuneModule())
+}
+
+func newTestServerNoDBWithAuth(t *testing.T, auth *AuthService) *Server {
+	t.Helper()
+
+	return NewServer(nil, nil, realtime.NewRegistry(), auth, NewNameThatTuneModule())
 }
 
 func newTestServer(t *testing.T, pool *pgxpool.Pool) *Server {
@@ -415,7 +438,7 @@ func newTestServer(t *testing.T, pool *pgxpool.Pool) *Server {
 	coreRepo := core.NewRepo(pool)
 	nttRepo := namethattune.NewRepo(pool)
 	rt := realtime.NewRegistry()
-	return NewServer(coreRepo, nttRepo, rt, nil)
+	return NewServer(coreRepo, nttRepo, rt, nil, NewNameThatTuneModule())
 }
 
 func freshDB(t *testing.T, ctx context.Context) *pgxpool.Pool {

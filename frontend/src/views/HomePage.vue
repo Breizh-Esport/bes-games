@@ -14,8 +14,14 @@
                     <p class="muted">{{ g.description }}</p>
                 </div>
                 <div class="game-actions">
-                    <RouterLink class="btn" :to="gameLink(g.id)"
+                    <RouterLink
+                        v-if="g.supported"
+                        class="btn"
+                        :to="gameLink(g.id)"
                         >Open</RouterLink
+                    >
+                    <span v-else class="btn btn-ghost disabled"
+                        >Frontend not installed</span
                     >
                 </div>
             </article>
@@ -82,6 +88,7 @@
 <script setup>
 import { onMounted, ref } from "vue";
 import { RouterLink } from "vue-router";
+import { gameLobbyPath, installedGames, supportsGame } from "../games";
 import { api, getApiBaseUrl } from "../lib/api";
 import { useAuth } from "../stores/auth";
 
@@ -90,17 +97,17 @@ const auth = useAuth();
 const apiBase = getApiBaseUrl();
 
 function gameLink(id) {
-    return `/games/${encodeURIComponent(id)}`;
+    return gameLobbyPath(id) || `/games/${encodeURIComponent(id)}`;
 }
 
-const fallbackGames = [
-    {
-        id: "name-that-tune",
-        name: "Name That Tune",
-        description:
-            "Guess songs as fast as you can. Rooms, playlists, buzzer, and synchronized playback state.",
-    },
-];
+function withFrontendSupport(games) {
+    return games.map((game) => ({
+        ...game,
+        supported: supportsGame(game.id),
+    }));
+}
+
+const fallbackGames = withFrontendSupport(installedGames);
 
 const games = ref(fallbackGames);
 const loadingGames = ref(false);
@@ -113,7 +120,10 @@ onMounted(() => {
         try {
             const res = await api.listGames();
             const gs = res?.games;
-            games.value = Array.isArray(gs) && gs.length ? gs : fallbackGames;
+            games.value =
+                Array.isArray(gs) && gs.length
+                    ? withFrontendSupport(gs)
+                    : fallbackGames;
         } catch (e) {
             games.value = fallbackGames;
             gamesError.value =

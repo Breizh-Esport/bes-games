@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	defaultAddr         = ":8080"
+	defaultAddr         = ":5080"
 	defaultReadTimeout  = 10 * time.Second
 	defaultWriteTimeout = 10 * time.Second
 	defaultIdleTimeout  = 60 * time.Second
@@ -78,7 +78,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	api := httpapi.NewServer(coreRepo, nttRepo, rt, authSvc)
+	api := httpapi.NewServer(coreRepo, nttRepo, rt, authSvc, httpapi.NewNameThatTuneModule())
 
 	allowedOrigins := splitCommaEnv("BES_CORS_ALLOWED_ORIGINS")
 	handler := api.Handler(httpapi.Options{

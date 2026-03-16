@@ -27,7 +27,7 @@ services:
       db:
         condition: service_healthy
     environment:
-      BES_ADDR: ":8080"
+      BES_ADDR: ":5080"
       # Backend reads DATABASE_URL (preferred) or BES_DATABASE_URL
       DATABASE_URL: "postgres://postgres:postgres@db:5432/bes_games?sslmode=disable"
       # Allow Vite dev server origin by default
@@ -37,7 +37,7 @@ services:
       # Optional: override migrations directory inside container
       # BES_MIGRATIONS_DIR: "backend/migrations"
     ports:
-      - "8080:8080"
+      - "5080:5080"
     restart: unless-stopped
 
 volumes:

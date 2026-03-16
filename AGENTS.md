@@ -29,8 +29,8 @@ Do not commit generated artifacts (see `.gitignore`, notably `frontend/dist/` an
 ## Build, Test, and Development Commands
 Backend:
 - `docker compose up -d db`: start local Postgres.
-- `DATABASE_URL="postgres://postgres:postgres@localhost:5432/bes_blind?sslmode=disable" go run ./backend/cmd/api`: run API (default `:8080`).
-- `curl http://localhost:8080/healthz`: verify server health.
+- `DATABASE_URL="postgres://postgres:postgres@localhost:5432/bes_blind?sslmode=disable" go run ./backend/cmd/api`: run API (default `:5080`).
+- `curl http://localhost:5080/healthz`: verify server health.
 
 Frontend:
 - `cd frontend; npm install; npm run dev`: run Vite dev server (default `http://localhost:5173`).

@@ -113,22 +113,24 @@
                 </div>
 
                 <div class="games-grid">
-                    <article class="game-tile">
+                    <article
+                        v-for="game in installedGames"
+                        :key="game.id"
+                        class="game-tile"
+                    >
                         <div>
-                            <div class="game-title">Name That Tune</div>
+                            <div class="game-title">{{ game.name }}</div>
                             <div class="muted small">
                                 Playlists and future game-specific settings.
                             </div>
                         </div>
                         <div class="actions">
-                            <RouterLink
-                                class="btn"
-                                to="/games/name-that-tune/settings/playlists"
+                            <RouterLink class="btn" :to="game.settingsPath"
                                 >Open</RouterLink
                             >
                             <RouterLink
                                 class="btn btn-ghost"
-                                to="/games/name-that-tune"
+                                :to="game.lobbyPath"
                                 >Lobby</RouterLink
                             >
                         </div>
@@ -177,6 +179,7 @@
 <script setup>
 import { computed, onMounted, ref } from "vue";
 import { RouterLink, useRouter } from "vue-router";
+import { installedGames } from "../games";
 import { api } from "../lib/api";
 import { useAuth } from "../stores/auth";
 

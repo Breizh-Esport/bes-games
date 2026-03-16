@@ -30,10 +30,10 @@ COPY --from=build /out/api /app/api
 COPY --from=build /src/backend/migrations /app/backend/migrations
 
 # Default listen address (can be overridden via env)
-ENV BES_ADDR=":8080"
+ENV BES_ADDR=":5080"
 ENV BES_MIGRATIONS_DIR="/app/backend/migrations"
 
-EXPOSE 8080
+EXPOSE 5080
 
 USER nonroot:nonroot
 

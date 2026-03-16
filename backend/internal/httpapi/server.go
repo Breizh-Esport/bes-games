@@ -68,6 +68,7 @@ type Server struct {
 	coreRepo              *core.Repo
 	nttRepo               *namethattune.Repo
 	rt                    *realtime.Registry
+	gameModules           []GameModule
 	rooms                 *roomLifecycle
 	buzzMu                sync.Mutex
 	buzzCD                map[string]map[string]time.Time
@@ -101,11 +102,16 @@ type Options struct {
 	ReadHeaderTimeout time.Duration
 }
 
-func NewServer(coreRepo *core.Repo, nttRepo *namethattune.Repo, rt *realtime.Registry, auth *AuthService) *Server {
+func NewServer(coreRepo *core.Repo, nttRepo *namethattune.Repo, rt *realtime.Registry, auth *AuthService, gameModules ...GameModule) *Server {
+	if len(gameModules) == 0 {
+		gameModules = []GameModule{NewNameThatTuneModule()}
+	}
+
 	s := &Server{
 		coreRepo:              coreRepo,
 		nttRepo:               nttRepo,
 		rt:                    rt,
+		gameModules:           append([]GameModule(nil), gameModules...),
 		buzzCD:                make(map[string]map[string]time.Time),
 		playerTokens:          make(map[string]map[string]string),
 		ownerTokens:           make(map[string]string),
@@ -173,27 +179,13 @@ func (s *Server) Handler(opts Options) http.Handler {
 	r.Route("/api", func(api chi.Router) {
 		api.Get("/games", s.handleListGames)
 
-		// Canonical per-game routes (prepared for multiple games).
-		api.Route("/games/name-that-tune", func(ntt chi.Router) {
-			ntt.Get("/rooms", s.handleListRooms)
-			ntt.Post("/rooms", s.requireAuth(s.handleCreateRoom))
-
-			ntt.Route("/rooms/{roomId}", func(rr chi.Router) {
-				rr.Get("/", s.handleGetRoom)
-				rr.Post("/join", s.handleJoinRoom)
-				rr.Post("/leave", s.handleLeaveRoom)
-
-				rr.Get("/ws", s.handleRoomWS)
+		for _, module := range s.gameModules {
+			module := module
+			meta := module.Meta()
+			api.Route("/games/"+meta.ID, func(game chi.Router) {
+				module.Mount(game, s)
 			})
-
-			// Game-specific playlists (owned by the authenticated user).
-			ntt.Get("/playlists", s.requireAuth(s.handleListPlaylists))
-			ntt.Post("/playlists", s.requireAuth(s.handleCreatePlaylist))
-			ntt.Patch("/playlists/{playlistId}", s.requireAuth(s.handlePatchPlaylist))
-			ntt.Post("/playlists/{playlistId}/items", s.requireAuth(s.handleAddPlaylistItem))
-			ntt.Patch("/playlists/{playlistId}/items/{itemId}", s.requireAuth(s.handlePatchPlaylistItem))
-			ntt.Delete("/playlists/{playlistId}/items/{itemId}", s.requireAuth(s.handleDeletePlaylistItem))
-		})
+		}
 
 		// Profile / account
 		api.Get("/me", s.requireAuth(s.handleGetMe))
@@ -224,7 +216,7 @@ func userSub(r *http.Request) string {
 			return strings.TrimSpace(info.Sub)
 		}
 	}
-	return strings.TrimSpace(r.Header.Get("X-User-Sub"))
+	return ""
 }
 
 func guestSub(r *http.Request) string {
@@ -1116,8 +1108,13 @@ func (s *Server) handleListRooms(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListGames(w http.ResponseWriter, r *http.Request) {
+	gamesList := make([]games.Game, 0, len(s.gameModules))
+	for _, module := range s.gameModules {
+		gamesList = append(gamesList, module.Meta())
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"games": games.List(),
+		"games": gamesList,
 	})
 }
 

@@ -33,7 +33,7 @@ DATABASE_URL="postgres://postgres:postgres@localhost:5432/bes_games?sslmode=disa
 Health check:
 
 ```sh
-curl http://localhost:8080/healthz
+curl http://localhost:5080/healthz
 ```
 
 ### OIDC configuration
@@ -74,7 +74,7 @@ npm run dev
 ```
 
 Override backend base URL:
-- `VITE_API_BASE_URL` (defaults to `http://localhost:8080`)
+- `VITE_API_BASE_URL` (defaults to `http://localhost:5080`)
 
 ### Docker
 
